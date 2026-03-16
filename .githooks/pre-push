@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+# Simple reminder: if exploration notebooks changed, nudge to update DECISIONS.md.
+changed_files=$(git diff --cached --name-only)
+
+if echo "$changed_files" | grep -E '^notebooks/exploration/'; then
+  echo "Reminder: You changed exploration notebooks."
+  echo "Consider updating DECISIONS.md with your rationale."
+fi

@@ -1,0 +1,16 @@
+name: analysis
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - click
+  - jupyter
+  - nbconvert
+  - ipykernel
+  - pytest
+  - black
+  - isort
+  - flake8
+  - pre-commit
+  - pyyaml

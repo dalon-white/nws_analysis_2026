@@ -1,0 +1,35 @@
+# Python / notebooks
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.notebook_cache/
+*.DS_Store
+
+# Environments
+.env
+.venv/
+.envrc
+*.swp
+
+# Data & outputs (protect sensitive data; commit only non-sensitive samples)
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/README.md
+data/processed/*
+!data/processed/.gitkeep
+!data/processed/README.md
+outputs/report/*.html
+outputs/report/*.pdf
+outputs/figures/*
+!outputs/figures/.gitkeep
+!outputs/figures/README.md
+outputs/tables/*
+!outputs/tables/.gitkeep
+!outputs/tables/README.md
+
+# Logs
+logs/
+*.log
+
+# OS / misc
+Thumbs.db

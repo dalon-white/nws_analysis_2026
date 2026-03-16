@@ -1,0 +1,20 @@
+name: Enable Repository Template
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  enable-template:
+    runs-on: ubuntu-latest
+    permissions:
+      administration: write
+    steps:
+      - name: Mark repository as a template
+        run: |
+          gh api --method PATCH /repos/${{ github.repository }} \
+            -f is_template=true \
+            --jq '.is_template'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

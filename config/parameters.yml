@@ -1,0 +1,15 @@
+project:
+  title: "<replace with your analysis question>"
+  owner: "<name>"
+  version: "v0.1.0"
+
+paths:
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  figures_dir: "outputs/figures"
+  tables_dir: "outputs/tables"
+  report_notebook: "notebooks/analysis/report.ipynb"
+  report_output_dir: "outputs/report"
+
+model:
+  random_seed: 42

@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nbconvert pytest black isort flake8
+          # Minimal pip-only installs; local env uses conda
+
+      - name: Lint
+        run: |
+          flake8 src tests
+          isort --check src tests
+          black --check src tests
+
+      - name: Test
+        run: pytest -q
+
+      - name: Build report (if notebook exists)
+        run: |
+          if [ -f notebooks/analysis/report.ipynb ]; then
+            jupyter nbconvert --to html --output-dir outputs/report notebooks/analysis/report.ipynb
+          else
+            echo "No notebooks/analysis/report.ipynb found. Skipping export."
+          fi
+
+      - name: Upload report artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: outputs/report
