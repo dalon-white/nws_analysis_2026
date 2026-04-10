@@ -1,0 +1,47 @@
+---
+title: "NWS Spread in Mexico"
+output: html_document
+---
+
+# Purpose: Explore the spread of NWS in Mexico, including mapping and analysis of rejection rates at ports.
+
+## IDEAS
+ # - Map detections in Mexico by location
+ # - For any that are moving, map start and finish
+    # - Also get the distance between start and finish
+ # - Quantify how fast it is moving
+    # - Like, a single polygon at time points, and the increase in area of the polygon over time?
+
+## Notes:
+
+ # - Human-assisted dispersal is primary method of spread
+ # - No false positives; not sure the effectiveness of the surveys and the rate of false negatives
+ # - The front is moving from central america; I do not know how many introductions there have been in Mexico
+
+ 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE
+)
+library(tidyverse)
+library(readxl)
+library(here)
+#library(ggmap)
+library(tidygeocoder)
+library(sf)
+library(stringi)
+```
+
+# Load processed NWS detections data
+```{r load-data}
+
+nws_detections <- readRDS(here("data", "processed", "nws_detections.rds"))
+glimpse(nws_detections)
+
+
+```
+
+
+
+
+
+

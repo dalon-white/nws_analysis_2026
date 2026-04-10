@@ -1,0 +1,276 @@
+---
+title: "Rejection Rate Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(readxl)
+library(here)
+library(car)
+library(viridis)
+library(effectsize)
+```
+
+## Load Data
+
+```{r load volume data}
+# Read the rejected_cattle tab of the Excel file.
+port_volume <- read_xlsx(
+	here("data", "raw", "cattle port data.xlsx"),
+	sheet = "volume_cattle"
+)
+
+glimpse(port_volume)
+```
+
+```{r load and simplify rejection reasons}
+rejections <- read_xlsx(
+	here("data", "raw", "cattle port data.xlsx"),
+	sheet = "rejected_cattle"
+)
+
+# Filter to only include rows where elevated_nws_risk is "yes", then group by port and year, and sum the volume of rejections.
+rejections <- rejections |>
+    filter(elevated_nws_risk == "yes") |>
+    group_by(port, year) |>
+    summarise(rejections = sum(volume, na.rm = TRUE), .groups = "drop")
+
+# filter out san luis which never had any shipments
+rejections <- rejections |>
+    filter(port != "san_luis")
+
+glimpse(rejections)
+```
+
+## Merge volume and rejection data
+
+```{r merge data}
+# Merge the volume and rejection data by port and year.
+rejections_volume <- rejections %>%
+    left_join(port_volume, by = c("port", "year"))
+
+rejections_volume <- rejections_volume %>%
+    mutate(rejection_rate = rejections / volume)
+
+rejections_volume <- rejections_volume %>%
+    mutate(across(c(port, year), as.factor))
+
+glimpse(rejections_volume)
+```
+
+## View rejection rates by port (factor) and year (x-axis)
+
+```{r plot rejection rates}
+rejections_volume <- rejections_volume %>%
+    mutate(log1p_rejection_rate = log1p(rejection_rate))
+
+rej_rate_plot <- ggplot(rejections_volume, aes(x = year, y = rejection_rate, color = port)) +
+    geom_boxplot(aes(group = year)) +
+    geom_line() +
+    geom_point() +
+    labs(title = "Rejection Rate by Port and Year", x = "Year", y = "Fourth Root of Rejection Rate") +
+    theme_minimal()
+
+rej_rate_plot <- rej_rate_plot +
+  scale_color_viridis_d(option = "D")
+
+rej_rate_fig <- here("outputs", "figures", "rejection_rate.png")
+ggsave(
+	filename = rej_rate_fig,
+	plot = rej_rate_plot,
+	width = 10,
+	height = 7,
+	dpi = 150
+)
+
+cat("Rejection rate figure saved to:", rej_rate_fig, "\n")
+knitr::include_graphics(rej_rate_fig)
+```
+
+
+## Check ANOVA Assumptions
+
+```{r check-anova-assumptions}
+# Check normality of rejection_rate
+shapiro_test <- shapiro.test(rejections_volume$rejection_rate)
+cat("Shapiro-Wilk normality test p-value:", shapiro_test$p.value, "\n")
+# non-normal
+
+#4th root transformation
+rejections_volume <- rejections_volume %>%
+    mutate(rejection_rate_4th_root = sqrt(sqrt(rejection_rate)))
+shapiro_test <- shapiro.test(rejections_volume$rejection_rate_4th_root)
+cat("Shapiro-Wilk normality test p-value:", shapiro_test$p.value, "\n")
+#this is normal; can use. - the previous data would probably have normally distributed residuals, which is the real test, but some high points in 2023 may have led astray; this is transformation will be preferable from an ANOVA stand point.
+
+# Check homogeneity of variances
+levene_test <- car::leveneTest(rejection_rate_4th_root ~ port, data = rejections_volume)
+cat("Levene's test for homogeneity of variances p-value:", levene_test$`Pr(>F)`[1], "\n")
+
+# Save the visualization of ANOVA assumptions
+assumptions_fig <- here("outputs", "figures", "anova_assumptions.png")
+
+png(assumptions_fig, width = 1600, height = 800, res = 150)
+par(mfrow = c(1, 2))
+hist(rejections_volume$rejection_rate_4th_root, main = "Histogram of Rejection Rate (4th Root)", xlab = "Rejection Rate (4th Root)")
+qqnorm(rejections_volume$rejection_rate_4th_root)
+qqline(rejections_volume$rejection_rate_4th_root, col = "red")
+par(mfrow = c(1, 1))
+dev.off()
+
+cat("ANOVA assumptions visualization saved to:", assumptions_fig, "\n")
+```
+
+## Conduct ANOVA
+
+```{r conduct-anova}
+# # Perform ANOVA on rejection_rate_4th_root by port
+# anova_result <- aov(rejection_rate_4th_root ~ port + year, data = rejections_volume)
+# summary(anova_result)
+
+# # Post-hoc test if ANOVA is significant
+# tukey_result_port <- TukeyHSD(anova_result, "port")
+# print(tukey_result_port)
+# tukey_result_year <- TukeyHSD(anova_result, "year")
+# print(tukey_result_year)
+
+
+# W/ year as a covariate
+rejections_volume <- rejections_volume %>%
+    mutate(year_numeric = as.numeric(as.character(year)))
+
+fit <- lm(rejection_rate_4th_root ~ port * year_numeric, data = rejections_volume)
+anova_result <- aov(fit)
+summary(anova_result)
+
+broom::tidy(fit)
+
+TukeyHSD(anova_result, "port")
+
+
+```
+
+```{r tukey-groupings-plot}
+# Perform Tukey's HSD test for port
+tukey_port <- TukeyHSD(anova_result, "port")
+
+#Extract Tukey's groupings
+  # The multcompLetters4 function needs names from the ANOVA result - not the actual TukeyHSD; so, run the ANOVA again without year as a covariate to get the correct names for the multcompLetters4 function
+anova_result_port <- aov(rejection_rate_4th_root ~ port, data = rejections_volume)
+  # Now extract the Tukey's groupings using names from the model with just port but the Groupings from the model with year as a covariate
+library(multcompView)
+tukey_letters <- multcompLetters4(anova_result_port, tukey_port)
+
+tukey_df <- data.frame(
+  port = names(tukey_letters$port$Letters),
+  group = tukey_letters$port$Letters
+)
+
+# Calculate mean rejection rates for each port
+mean_effects <- rejections_volume %>%
+  group_by(port) %>%
+  summarise(mean_rate = mean(rejection_rate_4th_root, na.rm = TRUE)) %>%
+  left_join(tukey_df, by = "port")
+
+# Save the Tukey's groupings plot
+tukey_plot_fig <- here("outputs", "figures", "tukey_groupings_port.png")
+
+ggplot(mean_effects, aes(x = reorder(port, mean_rate), y = mean_rate, fill = group)) +
+  geom_point(stat = "identity", show.legend = FALSE) +
+  geom_text(aes(label = group), vjust = -0.5) +
+  geom_errorbar(aes(ymin = mean_rate, ymax = mean_rate), width = 0.2) +
+  labs(
+    title = "Mean Effects of Port with Tukey's Groupings",
+    x = "Port",
+    y = "Mean Fourth Root of Rejection Rate"
+  ) +
+  theme_minimal() +
+  scale_fill_viridis_d() -> tukey_plot
+
+ggsave(
+  filename = tukey_plot_fig,
+  plot = tukey_plot,
+  width = 10,
+  height = 7,
+  dpi = 150
+)
+
+cat("Tukey's groupings plot saved to:", tukey_plot_fig, "\n")
+```
+
+## Mean Effects with 95% CI and Tukey's Groupings
+
+```{r tukey-groupings-errorbar-plot}
+# Calculate mean effects and 95% CI for each port
+port_ci <- rejections_volume %>%
+  group_by(port) %>%
+  summarise(
+    mean_rate = mean(rejection_rate_4th_root, na.rm = TRUE),
+    lower_ci = mean_rate - qt(0.975, df = n() - 1) * sd(rejection_rate_4th_root, na.rm = TRUE) / sqrt(n()),
+    upper_ci = mean_rate + qt(0.975, df = n() - 1) * sd(rejection_rate_4th_root, na.rm = TRUE) / sqrt(n())
+  ) %>%
+  left_join(tukey_df, by = "port")
+
+port_ci <- port_ci %>%
+  mutate(mean_rate = mean_rate^4) %>%
+  mutate(lower_ci = lower_ci^4) %>%
+  mutate(upper_ci = upper_ci^4)
+
+# Plot mean effects with 95% CI and Tukey's groupings
+tukey_errorbar_plot <- ggplot(port_ci, aes(x = reorder(port, mean_rate), y = mean_rate, fill = group)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.2) +
+  geom_text(aes(label = group), vjust = -0.5) +
+  labs(
+    title = "Mean Effects of Port with 95% CI and Tukey's Groupings",
+    x = "Port",
+    y = "Mean Rejection Rate"
+  ) +
+  theme_minimal() +
+  scale_fill_viridis_d()
+
+# Save the plot
+tukey_errorbar_fig <- here("outputs", "figures", "tukey_groupings_port_errorbar.png")
+
+ggsave(
+  filename = tukey_errorbar_fig,
+  plot = tukey_errorbar_plot,
+  width = 10,
+  height = 7,
+  dpi = 150
+)
+
+cat("Tukey's groupings plot with error bars saved to:", tukey_errorbar_fig, "\n")
+```
+
+# join rejection rates with tukeys groupings and mean effects for each port
+```{r join-rejection-rates}
+rejection_rates_with_tukey <- rejections_volume %>%
+  group_by(port) %>%
+  summarise(mean_rate = mean((rejection_rate_4th_root^4), na.rm = TRUE)) %>%
+  left_join(tukey_df, by = "port")
+```
+
+# Save rejection rates
+
+```{r save-rejection-rates}
+#save summary of rejection rates by port and year
+rejection_rates_csv <- here("outputs", "data", "rejection_rates.csv")
+rejection_rates_rds <- here("outputs", "data", "rejection_rates.rds")
+
+write_csv(rejections_volume, rejection_rates_csv)
+saveRDS(rejections_volume, rejection_rates_rds)
+
+cat("Rejection rates data saved to:", rejection_rates_csv, "and", rejection_rates_rds, "\n")
+
+# Save mean rejection rates with Tukey's groupings
+mean_rejection_rates_csv <- here("outputs", "data", "mean_rejection_rates_with_tukey.csv")
+mean_rejection_rates_rds <- here("outputs", "data", "mean_rejection_rates_with_tukey.rds")
+
+write_csv(rejection_rates_with_tukey, mean_rejection_rates_csv)
+saveRDS(rejection_rates_with_tukey, mean_rejection_rates_rds)
+
+cat("Mean rejection rates with Tukey's groupings saved to:", mean_rejection_rates_csv, "and", mean_rejection_rates_rds, "\n")
+```

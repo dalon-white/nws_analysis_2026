@@ -1,0 +1,6 @@
+#Packages
+# open terminal, make sure .venv is activated, and run: pip install -r requirements.txt
+pandas
+matplotlib
+numpy
+ipykernel #this can be run each time but only needs to be run once to install the kernel for jupyter nbs and allow jupyter to function with Python's .venv

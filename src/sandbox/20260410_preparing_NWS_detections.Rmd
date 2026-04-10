@@ -1,0 +1,432 @@
+---
+title: "Data Prep for: NWS Spread in Mexico"
+output: 
+  html_document: default
+  processed_data: default
+---
+
+
+ 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE
+)
+library(tidyverse)
+library(readxl)
+library(here)
+#library(ggmap)
+library(tidygeocoder)
+library(sf)
+library(stringi)
+```
+
+# Load data on NWS detections in Mexico
+```{r load data}
+nws_detections <- read_xlsx(
+    here("data", "raw", "NWS cases in Mexico.xlsx"),
+    sheet = "Cuadro resumen"
+) 
+glimpse(nws_detections)
+View(head(nws_detections))
+# the data switches from mm/dd/yyyy to dd/mm/yyyy at row 6003, so we need to fix that
+nws_detections <- nws_detections %>%
+    mutate(date = if_else(row_number() < 6003, as.Date(date, format = "%m/%d/%Y"), as.Date(date, format = "%d/%m/%Y")))
+
+# replace "N/A" with NA
+nws_detections <- nws_detections %>%
+    mutate(across(where(is.character), ~na_if(., "N/A")))
+
+# take state and municipality to lower case - this helps with the articles 'de/del/la/las'
+nws_detections <- nws_detections |>
+    rename(host_species = `Host Species`) |>
+    mutate(across(where(is.character), tolower))
+
+#shorten to villa de tututepec, oaxaca to match the detections data, which has it as villa de tututepec, oaxaca
+print(nws_detections |> filter(str_detect(Municipality, "villa de tututepec")) |> distinct(Municipality))
+nws_detections <- nws_detections |> mutate(Municipality = if_else(str_detect(Municipality, "villa de tututepec"), "villa de tututepec", Municipality))
+print(nws_detections |> filter(str_detect(Municipality, "villa de tututepec")) |> distinct(Municipality))
+
+# save to processed data folder
+write_csv(nws_detections, here("data", "processed", "nws_detections.csv"))
+saveRDS(nws_detections, here("data", "processed", "nws_detections.rds"))
+```
+
+## output some summary stats about the detections
+```{r summary stats}
+range(nws_detections$date)
+#hosts
+print(nws_detections |> count(host_species) |> arrange(desc(n)))
+#states
+print(nws_detections |> count(State) |> arrange(desc(n)))
+#number origin/destination
+print(nws_detections |> filter(is.na(Origin) & is.na(Destination)) |> count())
+```
+
+## Load Mexico georeference data
+```{r load georeference data}
+mexico_municip_geo <- sf::st_read(here("data", "raw", "mexico_municipalities_full.geojson"))
+
+#take the state and municipality to lower case to match the detections data
+mexico_municip_geo <- mexico_municip_geo %>%
+    mutate(across(where(is.character), tolower))
+
+head(mexico_municip_geo)
+glimpse(mexico_municip_geo)
+
+#Shorten veracruz to veracruz to match the detections data, which has it as veracruz
+print(mexico_municip_geo |> filter(str_detect(NOMGEO, "veracruz")) |> distinct(NOMGEO))
+mexico_municip_geo <- mexico_municip_geo |> mutate(NOMGEO = if_else(str_detect(NOMGEO, "veracruz"), "veracruz", NOMGEO))
+print(mexico_municip_geo |> filter(str_detect(NOMGEO, "veracruz")) |> distinct(NOMGEO))
+
+#Shorten to cintalapa, chiapas to match the detections data, which has it as cintalapa, chiapas
+print(mexico_municip_geo |> filter(str_detect(NOMMUN, "cintalapa")) |> distinct(NOMMUN))
+mexico_municip_geo <- mexico_municip_geo |> mutate(NOMMUN = if_else(str_detect(NOMMUN, "cintalapa"), "cintalapa", NOMMUN))
+print(mexico_municip_geo |> filter(str_detect(NOMMUN, "cintalapa")) |> distinct(NOMMUN))
+
+# save to processed data folder
+sf::st_write(mexico_municip_geo,
+            here("data", "processed", "mexico_municip_geo.geojson"),
+            delete_dsn = TRUE)
+saveRDS(mexico_municip_geo, here("data", "processed", "mexico_municip_geo.rds"))
+
+mexico_municip_geo <- mexico_municip_geo |> rename(municipality_geometry = geometry)
+
+
+## Load mexico state data
+mexico_states_geo <- sf::st_read(here("data", "raw", "mexico_states_full.geojson"))
+
+#take the state and municipality to lower case to match the detections data
+mexico_states_geo <- mexico_states_geo %>%
+    mutate(across(where(is.character), tolower))
+
+#Shorten veracruz to veracruz to match the detections data, which has it as veracruz
+print(mexico_states_geo |> filter(str_detect(NOMGEO, "veracruz")) |> distinct(NOMGEO))
+mexico_states_geo <- mexico_states_geo |> mutate(NOMGEO = if_else(str_detect(NOMGEO, "veracruz"), "veracruz", NOMGEO))
+print(mexico_states_geo |> filter(str_detect(NOMGEO, "veracruz")) |> distinct(NOMGEO))
+
+
+head(mexico_states_geo)
+glimpse(mexico_states_geo)
+
+
+# save to processed data folder
+sf::st_write(mexico_states_geo, here("data", "processed", "mexico_states_geo.geojson"), delete_dsn = TRUE)
+saveRDS(mexico_states_geo, here("data", "processed", "mexico_states_geo.rds"))
+
+mexico_states_geo <- mexico_states_geo |> rename(state_geometry = geometry)
+
+mexico_states_geo <- mexico_states_geo |> dplyr::select(CVEGEO, state_geometry)
+
+# SF doesn't like when there are 2 geometries, because it donesn't know which is active.
+# Dropping geometry from states will allow a join but that drops the geometry entirely.
+# Changing to a tibble preserverse the states_geometry column as it was but drops it as an sfc class, which allows left_join to work well.
+mexico_states_lookup <- tibble::tibble(
+    mexico_states_geo
+)
+
+#bind them, rename as necessary, and make active.
+mexico_geo <- mexico_municip_geo %>%
+    dplyr::left_join(
+        mexico_states_lookup,
+        by = c("CVE_ENT" = "CVEGEO")
+    ) %>%
+    sf::st_as_sf(sf_column_name = "municipality_geometry") %>%
+    sf::st_make_valid()
+
+# In the future use st_set_geometry("state_geometry") to get the state geometry and st_set_geometry("municipality_geometry") to get the municipality geometry, and then can do spatial operations with those geometries as needed.
+
+# save to processed data folder
+sf::st_write(mexico_geo, here("data", "processed", "mexico_geo.geojson"), delete_dsn = TRUE)
+saveRDS(mexico_geo, here("data", "processed", "mexico_geo.rds"))
+```
+
+
+## Create singular approach for matching the georeference data to the detections data
+```{r create singular approach for matching georeference data}
+# create a function that takes in the detections data and the georeference data and returns the detections data with the georeference data joined on
+match_georeference <- function(detections, georeference) {
+    detections_cols <- colnames(detections)
+
+    detections_geo <- detections %>%
+        dplyr::left_join(georeference, by = c("State" = "NOMGEO", "Municipality" = "NOMMUN"))
+
+    unknown_locations <- detections_geo |>
+        dplyr::filter(is.na(CVEGEO)) |>
+        dplyr::select(dplyr::all_of(detections_cols)) |>
+        dplyr::mutate(
+            Municipality_plain = stri_trans_general(Municipality, "Latin-ASCII"),
+            State_plain = stri_trans_general(State, "Latin-ASCII")
+        )
+
+    georeference_plain <- georeference %>%
+        dplyr::mutate(
+            NOMMUN_plain = stri_trans_general(NOMMUN, "Latin-ASCII"),
+            NOMGEO_plain = stri_trans_general(NOMGEO, "Latin-ASCII")
+        )
+
+    detections_geo_plain <- unknown_locations |>
+        dplyr::left_join(
+            georeference_plain,
+            by = c("State_plain" = "NOMGEO_plain", "Municipality_plain" = "NOMMUN_plain")
+        )
+
+    cat("Unmatched locations after plain text join:\n")
+    print(
+        detections_geo_plain |>
+            dplyr::group_by(State, Municipality) |>
+            dplyr::filter(is.na(CVEGEO)) |>
+            dplyr::count() |>
+            dplyr::arrange(dplyr::desc(n))
+    )
+
+    detections_geo_plain <- detections_geo_plain |>
+        dplyr::filter(!is.na(CVEGEO)) |>
+        dplyr::select(-dplyr::any_of(c("Municipality_plain", "State_plain")))
+
+    dplyr::bind_rows(
+        detections_geo |> dplyr::filter(!is.na(CVEGEO)),
+        detections_geo_plain
+    )
+}
+
+detections_geo_final <- match_georeference(nws_detections, mexico_geo)
+
+# save matched detections to processed data folder
+sf::st_write(
+    detections_geo_final,
+    here("data", "processed", "nws_detections_geo.geojson"),
+    delete_dsn = TRUE
+)
+saveRDS(detections_geo_final, here("data", "processed", "nws_detections_geo.rds"))
+
+```
+
+
+## Separate out the origin and destination data for the detections
+```{r separate origin and destination data}
+normalize_place_name <- function(x) {
+    x %>%
+        stri_trans_general("Latin-ASCII") %>%
+        stringr::str_replace_all("\\([^)]*\\)", " ") %>%
+        stringr::str_replace_all(":.*$", " ") %>%
+        stringr::str_replace_all("[^[:alnum:], ]", " ") %>%
+        stringr::str_squish()
+}
+
+build_lookup_tables <- function(georeference) {
+    georeference_points <- georeference %>%
+        sf::st_transform(3857) %>%
+        sf::st_point_on_surface() %>%
+        sf::st_transform(4326)
+
+    point_coords <- sf::st_coordinates(georeference_points)
+
+    municipality_lookup <- georeference_points %>%
+        dplyr::mutate(
+            municipality_plain = normalize_place_name(NOMMUN),
+            state_plain = normalize_place_name(NOMGEO),
+            lon = point_coords[, 1],
+            lat = point_coords[, 2]
+        ) %>%
+        sf::st_drop_geometry() %>%
+        dplyr::select(CVEGEO, NOMGEO, NOMMUN, state_plain, municipality_plain, lon, lat)
+
+    state_lookup <- municipality_lookup %>%
+        dplyr::distinct(NOMGEO, state_plain)
+
+    list(
+        state_lookup = state_lookup,
+        municipality_lookup = municipality_lookup
+    )
+}
+
+find_state_match <- function(state_text, raw_text, state_lookup) {
+    state_candidates <- character(0)
+
+    if (!is.na(state_text) && nzchar(state_text)) {
+        state_candidates <- state_lookup$state_plain[state_lookup$state_plain == state_text]
+        if (length(state_candidates) == 0) {
+            state_candidates <- state_lookup$state_plain[
+                stringr::str_detect(state_lookup$state_plain, stringr::fixed(state_text)) |
+                    stringr::str_detect(state_text, stringr::fixed(state_lookup$state_plain))
+            ]
+        }
+    }
+
+    if (length(state_candidates) == 0 && !is.na(raw_text) && nzchar(raw_text)) {
+        state_candidates <- state_lookup$state_plain[
+            stringr::str_detect(raw_text, stringr::fixed(state_lookup$state_plain))
+        ]
+    }
+
+    if (length(state_candidates) == 0) {
+        return(NA_character_)
+    }
+
+    state_candidates[which.max(nchar(state_candidates))]
+}
+
+find_municipality_match <- function(muni_text, raw_text, state_match, municipality_lookup) {
+    candidates <- municipality_lookup
+
+    if (!is.na(state_match)) {
+        candidates <- candidates[candidates$state_plain == state_match, , drop = FALSE]
+    }
+
+    if (nrow(candidates) == 0) {
+        return(NULL)
+    }
+
+    query <- muni_text
+    if (is.na(query) || !nzchar(query)) {
+        query <- raw_text
+    }
+
+    if (is.na(query) || !nzchar(query)) {
+        return(NULL)
+    }
+
+    if (!is.na(state_match) && nzchar(state_match)) {
+        query <- stringr::str_replace_all(query, stringr::fixed(state_match), " ")
+        query <- stringr::str_squish(query)
+    }
+
+    if (!nzchar(query)) {
+        return(NULL)
+    }
+
+    exact <- candidates[candidates$municipality_plain == query, , drop = FALSE]
+    if (nrow(exact) > 0) {
+        return(exact[1, , drop = FALSE])
+    }
+
+    contains <- candidates[
+        stringr::str_detect(candidates$municipality_plain, stringr::fixed(query)) |
+            stringr::str_detect(query, stringr::fixed(candidates$municipality_plain)),
+        ,
+        drop = FALSE
+    ]
+
+    if (nrow(contains) == 0) {
+        return(NULL)
+    }
+
+    contains[which.max(nchar(contains$municipality_plain)), , drop = FALSE]
+}
+
+match_transport_locations <- function(data, state_lookup, municipality_lookup, municipality_col, state_col, raw_col, prefix) {
+    match_rows <- lapply(seq_len(nrow(data)), function(row_id) {
+        raw_value <- normalize_place_name(data[[raw_col]][row_id])
+        municipality_value <- data[[municipality_col]][row_id]
+        state_value <- data[[state_col]][row_id]
+
+        municipality_plain <- normalize_place_name(municipality_value)
+        state_plain <- normalize_place_name(state_value)
+
+        result <- list(row_id = row_id)
+        result[[paste0(prefix, "_matched_state")]] <- NA_character_
+        result[[paste0(prefix, "_matched_municipality")]] <- NA_character_
+        result[[paste0(prefix, "_cvegeo")]] <- NA_character_
+        result[[paste0(prefix, "_lon")]] <- NA_real_
+        result[[paste0(prefix, "_lat")]] <- NA_real_
+        result[[paste0(prefix, "_match_method")]] <- NA_character_
+
+        state_match <- find_state_match(state_plain, raw_value, state_lookup)
+        municipality_match <- find_municipality_match(municipality_plain, raw_value, state_match, municipality_lookup)
+
+        if (is.null(municipality_match)) {
+            return(tibble::as_tibble(result))
+        }
+
+        result[[paste0(prefix, "_matched_state")]] <- municipality_match$NOMGEO[[1]]
+        result[[paste0(prefix, "_matched_municipality")]] <- municipality_match$NOMMUN[[1]]
+        result[[paste0(prefix, "_cvegeo")]] <- municipality_match$CVEGEO[[1]]
+        result[[paste0(prefix, "_lon")]] <- municipality_match$lon[[1]]
+        result[[paste0(prefix, "_lat")]] <- municipality_match$lat[[1]]
+        result[[paste0(prefix, "_match_method")]] <- "lookup_contains"
+
+        tibble::as_tibble(result)
+    })
+
+    matches <- dplyr::bind_rows(match_rows)
+
+    data %>%
+        dplyr::mutate(row_id = dplyr::row_number()) %>%
+        dplyr::left_join(matches, by = "row_id") %>%
+        dplyr::select(-row_id)
+}
+
+# Separate out the origin and destination data for the detections
+detections_transport <- nws_detections %>%
+    dplyr::filter(
+        !is.na(Origin),
+        !is.na(Destination),
+        Origin != "na",
+        Destination != "na"
+    )
+
+# Convert Origin to a origin_state, origin_municipality column, and Destination to a destination_state or destination_municipality column
+# The Origin and Destination are "municipality, state" but sometimes missing a comma, and sometimes missing a space after the comma, so we need to clean that up first
+detections_transport <- detections_transport %>%
+    dplyr::mutate(
+        orig = Origin,
+        dest = Destination,
+        Origin = str_replace_all(Origin, "\\s*,\\s*", ", "),
+        Origin = str_squish(Origin),
+        Destination = str_replace_all(Destination, "\\s*,\\s*", ", "),
+        Destination = str_squish(Destination)
+    )
+
+detections_transport <- detections_transport %>%
+    tidyr::separate(Origin, into = c("origin_municipality", "origin_state"), sep = ", ", fill = "right", extra = "merge") %>%
+    tidyr::separate(Destination, into = c("destination_municipality", "destination_state"), sep = ", ", fill = "right", extra = "merge")
+
+lookup_tables <- build_lookup_tables(mexico_municip_geo)
+state_lookup <- lookup_tables$state_lookup
+municipality_lookup <- lookup_tables$municipality_lookup
+
+detections_transport <- detections_transport %>%
+    match_transport_locations(
+        state_lookup = state_lookup,
+        municipality_lookup = municipality_lookup,
+        municipality_col = "origin_municipality",
+        state_col = "origin_state",
+        raw_col = "orig",
+        prefix = "origin"
+    ) %>%
+    match_transport_locations(
+        state_lookup = state_lookup,
+        municipality_lookup = municipality_lookup,
+        municipality_col = "destination_municipality",
+        state_col = "destination_state",
+        raw_col = "dest",
+        prefix = "destination"
+    )
+
+View(detections_transport)
+
+cat("Unmatched origin locations after state-constrained fuzzy matching:\n")
+print(
+    detections_transport %>%
+        dplyr::filter(is.na(origin_lon) | is.na(origin_lat)) %>%
+        dplyr::count(origin_state, origin_municipality, sort = TRUE)
+)
+
+cat("Unmatched destination locations after state-constrained fuzzy matching:\n")
+print(
+    detections_transport %>%
+        dplyr::filter(is.na(destination_lon) | is.na(destination_lat)) %>%
+        dplyr::count(destination_state, destination_municipality, sort = TRUE)
+)
+
+
+detections_transport <- detections_transport |>
+    dplyr::filter(!(is.na(origin_cvegeo) | is.na(destination_cvegeo)))
+
+write.csv(detections_transport, here("data", "processed", "nws_detections_transport.csv"))
+saveRDS(detections_transport, here("data", "processed", "nws_detections_transport.rds"))
+sf::st_write(
+    detections_transport,
+    here("data", "processed", "nws_detections_transport.geojson"),
+    delete_dsn = TRUE
+)
+```
