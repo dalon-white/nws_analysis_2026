@@ -29,19 +29,495 @@ library(here)
 library(tidygeocoder)
 library(sf)
 library(stringi)
+library(mapview)
 ```
 
 # Load processed NWS detections data
 ```{r load-data}
 
-nws_detections <- readRDS(here("data", "processed", "nws_detections.rds"))
-glimpse(nws_detections)
+nws_detections_geo <- readRDS(here("data", "processed", "nws_detections_geo.rds"))
+glimpse(nws_detections_geo)
+
+nws_detections_transport <- readRDS(here("data", "processed", "nws_detections_transport.rds"))
+glimpse(nws_detections_transport)
+
+```
+
+## Map start and end locations of NWS detections
+```{r map-start-end-locations}
+
+required_cols <- c("origin_lon", "origin_lat", "destination_lon", "destination_lat")
+missing_cols <- setdiff(required_cols, colnames(nws_detections_transport))
+if (length(missing_cols) > 0) {
+   stop(paste("Missing required columns in nws_detections_transport:", paste(missing_cols, collapse = ", ")))
+}
+
+mexico_states <- sf::st_read(
+   here("data", "processed", "mexico_states_geo.geojson"),
+   quiet = TRUE
+) %>%
+   sf::st_transform(4326)
+
+origin_counts <- nws_detections_transport %>%
+   dplyr::filter(!is.na(origin_lon), !is.na(origin_lat)) %>%
+   dplyr::group_by(origin_lon, origin_lat) %>%
+   dplyr::summarise(origin_count = dplyr::n(), .groups = "drop")
+
+origin_points <- origin_counts %>%
+   sf::st_as_sf(coords = c("origin_lon", "origin_lat"), crs = 4326, remove = FALSE)
+
+destination_counts <- nws_detections_transport %>%
+   dplyr::filter(!is.na(destination_lon), !is.na(destination_lat)) %>%
+   dplyr::group_by(destination_lon, destination_lat) %>%
+   dplyr::summarise(destination_count_point = dplyr::n(), .groups = "drop")
+
+destination_points <- destination_counts %>%
+   sf::st_as_sf(coords = c("destination_lon", "destination_lat"), crs = 4326, remove = FALSE)
+
+# Keep non-aggregated destination records for state-level totals.
+destination_records <- nws_detections_transport %>%
+   dplyr::filter(!is.na(destination_lon), !is.na(destination_lat)) %>%
+   sf::st_as_sf(coords = c("destination_lon", "destination_lat"), crs = 4326, remove = FALSE)
+
+destination_with_state <- sf::st_join(
+   destination_records,
+   mexico_states %>% dplyr::select(CVEGEO),
+   join = sf::st_intersects,
+   left = TRUE
+)
+
+destination_counts_by_state <- destination_with_state %>%
+   sf::st_drop_geometry() %>%
+   dplyr::filter(!is.na(CVEGEO)) %>%
+   dplyr::count(CVEGEO, name = "destination_count")
+
+states_destination_map <- mexico_states %>%
+   dplyr::left_join(destination_counts_by_state, by = "CVEGEO") %>%
+   dplyr::mutate(destination_count = tidyr::replace_na(destination_count, 0L))
+
+flow_counts <- nws_detections_transport %>%
+   dplyr::filter(
+      !is.na(origin_lon),
+      !is.na(origin_lat),
+      !is.na(destination_lon),
+      !is.na(destination_lat)
+   ) %>%
+   dplyr::group_by(origin_lon, origin_lat, destination_lon, destination_lat) %>%
+   dplyr::summarise(n_flow = dplyr::n(), .groups = "drop") %>%
+   dplyr::mutate(flow_id = dplyr::row_number())
+
+if (nrow(flow_counts) == 0) {
+   stop("No complete origin/destination coordinates found to build flow lines.")
+}
+
+flow_lines <- sf::st_sf(
+   flow_id = flow_counts$flow_id,
+   n_flow = flow_counts$n_flow,
+   geometry = sf::st_sfc(
+      lapply(seq_len(nrow(flow_counts)), function(i) {
+         sf::st_linestring(
+            matrix(
+               c(
+                  flow_counts$origin_lon[i], flow_counts$origin_lat[i],
+                  flow_counts$destination_lon[i], flow_counts$destination_lat[i]
+               ),
+               ncol = 2,
+               byrow = TRUE
+            )
+         )
+      }),
+      crs = 4326
+   )
+)
+
+destination_flow_points <- flow_counts %>%
+   sf::st_as_sf(coords = c("destination_lon", "destination_lat"), crs = 4326, remove = FALSE)
+
+# Build geometry-based arrowheads (no external arrow package required).
+flow_coords_3857 <- flow_counts %>%
+   dplyr::select(flow_id, n_flow, origin_lon, origin_lat, destination_lon, destination_lat) %>%
+   sf::st_as_sf(coords = c("origin_lon", "origin_lat"), crs = 4326, remove = FALSE) %>%
+   sf::st_transform(3857)
+
+origin_xy <- sf::st_coordinates(flow_coords_3857)
+
+dest_coords_3857 <- flow_counts %>%
+   sf::st_as_sf(coords = c("destination_lon", "destination_lat"), crs = 4326, remove = FALSE) %>%
+   sf::st_transform(3857)
+
+dest_xy <- sf::st_coordinates(dest_coords_3857)
+
+rotate_vec <- function(vx, vy, angle_rad) {
+   c(
+      vx * cos(angle_rad) - vy * sin(angle_rad),
+      vx * sin(angle_rad) + vy * cos(angle_rad)
+   )
+}
+
+arrow_size <- scales::rescale(log1p(flow_counts$n_flow), to = c(18000, 52000))
+arrow_angle <- pi / 7
+
+arrow_rows <- lapply(seq_len(nrow(flow_counts)), function(i) {
+   vec <- c(dest_xy[i, 1] - origin_xy[i, 1], dest_xy[i, 2] - origin_xy[i, 2])
+   vec_norm <- sqrt(sum(vec^2))
+
+   if (is.na(vec_norm) || vec_norm == 0) {
+      return(NULL)
+   }
+
+   u <- vec / vec_norm
+   wing1 <- rotate_vec(u[1], u[2], pi - arrow_angle)
+   wing2 <- rotate_vec(u[1], u[2], pi + arrow_angle)
+
+   tip <- dest_xy[i, ]
+   base1 <- tip + arrow_size[i] * wing1
+   base2 <- tip + arrow_size[i] * wing2
+
+   tibble::tibble(
+      flow_id = flow_counts$flow_id[i],
+      n_flow = flow_counts$n_flow[i],
+      geom1 = list(sf::st_linestring(rbind(tip, base1))),
+      geom2 = list(sf::st_linestring(rbind(tip, base2)))
+   )
+})
+
+arrow_table <- dplyr::bind_rows(arrow_rows)
+
+arrowhead_segments <- dplyr::bind_rows(
+   arrow_table %>% dplyr::transmute(flow_id, n_flow, geometry = geom1),
+   arrow_table %>% dplyr::transmute(flow_id, n_flow, geometry = geom2)
+) %>%
+   sf::st_as_sf(crs = 3857) %>%
+   sf::st_transform(4326)
+
+# Repeat each unique line by its count so overlap darkens naturally via alpha blending.
+line_repeat_index <- rep(seq_len(nrow(flow_lines)), flow_lines$n_flow)
+flow_lines_alpha <- flow_lines[line_repeat_index, ]
+
+cat("Number of unique origin-destination flow lines:", nrow(flow_lines), "\n")
+cat("Number of transport records rendered as alpha-stacked lines:", nrow(flow_lines_alpha), "\n")
+cat("Number of unique origin points:", nrow(origin_points), "\n")
+cat("Number of unique destination points:", nrow(destination_points), "\n")
+
+flow_map <- mapview::mapview(
+   states_destination_map,
+   zcol = "destination_count",
+   layer.name = "Destinations by state",
+   lwd = 1,
+   alpha.regions = 0.75,
+   col.regions = colorRampPalette(c("#f7fbff", "#6baed6", "#08306b"))(8)
+) +
+   mapview::mapview(flow_lines_alpha, color = "firebrick", lwd = 2.5, alpha = 0.08, layer.name = "Spread path (alpha overlap)", legend = FALSE) +
+   mapview::mapview(arrowhead_segments, color = "firebrick", lwd = 2.8, alpha = 1, layer.name = "Flow direction") +
+   mapview::mapview(
+      origin_points,
+      zcol = "origin_count",
+      col.regions = colorRampPalette(c("#c6dbef", "#2171b5", "#08306b"))(8),
+      cex = 5,
+      alpha = 0.95,
+      layer.name = "Origin (count at point)"
+   ) +
+   mapview::mapview(
+      destination_points,
+      zcol = "destination_count_point",
+      col.regions = colorRampPalette(c("#fdd0a2", "#e6550d", "#7f2704"))(8),
+      cex = 5,
+      alpha = 0.95,
+      layer.name = "Destination (count at point)"
+   )
+
+output_dir <- here("outputs", "figures")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+htmlwidgets::saveWidget(
+   flow_map@map,
+   file = file.path(output_dir, "flow_map.html"),
+   selfcontained = TRUE
+)
+
+cat("Saved interactive map to:", file.path(output_dir, "flow_map.html"), "\n")
+
+flow_map
+
 
 
 ```
 
+## Map detections by state
+```{r map-detections-by-state}
 
+mexico_states_geo <- sf::st_read(
+   here("data", "processed", "mexico_states_geo.geojson"),
+   quiet = TRUE
+) %>%
+   sf::st_transform(4326)
 
+detection_points <- nws_detections_geo %>%
+   sf::st_make_valid() %>%
+   sf::st_transform(4326) %>%
+   dplyr::filter(!sf::st_is_empty(.)) %>%
+   sf::st_point_on_surface()
 
+if ("State" %in% colnames(nws_detections_geo)) {
+   detections_by_state <- nws_detections_geo %>%
+      sf::st_drop_geometry() %>%
+      dplyr::filter(!is.na(State)) %>%
+      dplyr::count(State, name = "detection_count")
 
+   states_detection_map <- mexico_states_geo %>%
+      dplyr::left_join(detections_by_state, by = c("NOMGEO" = "State")) %>%
+      dplyr::mutate(detection_count = tidyr::replace_na(detection_count, 0L))
+} else {
+   detections_with_state <- sf::st_join(
+      detection_points,
+      mexico_states_geo %>% dplyr::select(CVEGEO),
+      join = sf::st_intersects,
+      left = TRUE
+   )
 
+   detections_by_state <- detections_with_state %>%
+      sf::st_drop_geometry() %>%
+      dplyr::filter(!is.na(CVEGEO)) %>%
+      dplyr::count(CVEGEO, name = "detection_count")
+
+   states_detection_map <- mexico_states_geo %>%
+      dplyr::left_join(detections_by_state, by = "CVEGEO") %>%
+      dplyr::mutate(detection_count = tidyr::replace_na(detection_count, 0L))
+}
+
+cat("States with at least one detection:", sum(states_detection_map$detection_count > 0), "\n")
+
+states_detection_map <- states_detection_map %>%
+   dplyr::mutate(
+      area_km2 = as.numeric(sf::st_area(sf::st_transform(geometry, 6933))) / 1e6,
+      detection_density = dplyr::if_else(area_km2 > 0, detection_count / area_km2, NA_real_)
+   )
+
+cat("Maximum state detection density (detections per km^2):", round(max(states_detection_map$detection_density, na.rm = TRUE), 4), "\n")
+
+state_map <- mapview::mapview(
+   states_detection_map,
+   zcol = "detection_density",
+   layer.name = "State detection density",
+   lwd = 0,
+   alpha.regions = 0.85,
+   col.regions = colorRampPalette(c("#f7fbff", "#6baed6", "#08306b"))(8)
+)
+
+output_dir <- here("outputs", "figures")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+htmlwidgets::saveWidget(
+   state_map@map,
+   file = file.path(output_dir, "state_detections_map.html"),
+   selfcontained = TRUE
+)
+
+cat("Saved interactive state map to:", file.path(output_dir, "state_detections_map.html"), "\n")
+
+state_map
+
+```
+
+## Heatmap of all detection locations
+```{r map-all-detections-heatmap}
+
+# Build detection points robustly whether nws_detections_geo is sf or a plain data frame.
+if (inherits(nws_detections_geo, "sf")) {
+   detection_points_all <- nws_detections_geo %>%
+      sf::st_make_valid() %>%
+      sf::st_transform(4326) %>%
+      dplyr::filter(!sf::st_is_empty(.)) %>%
+      sf::st_point_on_surface()
+
+   detection_coords <- sf::st_coordinates(detection_points_all)
+
+   nws_detection_points_latlon <- detection_points_all %>%
+      sf::st_drop_geometry() %>%
+      dplyr::mutate(
+         lon = detection_coords[, 1],
+         lat = detection_coords[, 2]
+      )
+} else {
+   geo_col_candidates <- c("municipality_geometry", "state_geometry", "geometry")
+   geo_col_candidates <- geo_col_candidates[geo_col_candidates %in% colnames(nws_detections_geo)]
+
+   geo_col <- NA_character_
+   if (length(geo_col_candidates) > 0) {
+      for (cand in geo_col_candidates) {
+         if (inherits(nws_detections_geo[[cand]], "sfc")) {
+            geo_col <- cand
+            break
+         }
+      }
+   }
+
+   if (!is.na(geo_col)) {
+      detection_points_all <- nws_detections_geo %>%
+         sf::st_as_sf(sf_column_name = geo_col) %>%
+         sf::st_make_valid() %>%
+         sf::st_transform(4326) %>%
+         dplyr::filter(!sf::st_is_empty(.)) %>%
+         sf::st_point_on_surface()
+
+      detection_coords <- sf::st_coordinates(detection_points_all)
+
+      nws_detection_points_latlon <- detection_points_all %>%
+         sf::st_drop_geometry() %>%
+         dplyr::mutate(
+            lon = detection_coords[, 1],
+            lat = detection_coords[, 2]
+         )
+   } else {
+      lon_candidates <- c("lon", "Lon", "LON", "longitude", "Longitude", "LONGITUDE", "x", "X")
+      lat_candidates <- c("lat", "Lat", "LAT", "latitude", "Latitude", "LATITUDE", "y", "Y")
+
+      lon_col <- lon_candidates[lon_candidates %in% colnames(nws_detections_geo)][1]
+      lat_col <- lat_candidates[lat_candidates %in% colnames(nws_detections_geo)][1]
+
+      if (is.na(lon_col) || is.na(lat_col)) {
+         stop(
+            "Could not find geometry or lon/lat columns in nws_detections_geo. ",
+            "Expected an sf object, an sfc column (e.g., municipality_geometry), or lon/lat columns."
+         )
+      }
+
+      nws_detection_points_latlon <- nws_detections_geo %>%
+         dplyr::mutate(
+            lon = .data[[lon_col]],
+            lat = .data[[lat_col]]
+         ) %>%
+         dplyr::filter(!is.na(lon), !is.na(lat))
+
+      detection_points_all <- nws_detection_points_latlon %>%
+         sf::st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+   }
+}
+
+cat("Total detections with lat/lon:", nrow(nws_detection_points_latlon), "\n")
+
+# Destination points come from transport records.
+destination_points_latlon <- nws_detections_transport %>%
+   dplyr::filter(!is.na(destination_lon), !is.na(destination_lat)) %>%
+   dplyr::transmute(
+      lon = destination_lon,
+      lat = destination_lat
+   )
+
+cat("Total destinations with lat/lon:", nrow(destination_points_latlon), "\n")
+
+output_dir <- here("outputs", "figures")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+if (requireNamespace("leaflet.extras", quietly = TRUE)) {
+   detection_heatmap <- leaflet::leaflet() %>%
+      leaflet::addProviderTiles("CartoDB.Positron") %>%
+      leaflet.extras::addHeatmap(
+         data = nws_detection_points_latlon,
+         lng = ~lon,
+         lat = ~lat,
+         blur = 18,
+         radius = 14,
+         max = 1,
+         minOpacity = 0.35,
+         group = "Observations",
+         gradient = c("0.4" = "#c6dbef", "0.65" = "#4292c6", "1.0" = "#08306b")
+      )
+
+   if (nrow(destination_points_latlon) > 0) {
+      detection_heatmap <- detection_heatmap %>%
+         leaflet.extras::addHeatmap(
+            data = destination_points_latlon,
+            lng = ~lon,
+            lat = ~lat,
+            blur = 18,
+            radius = 14,
+            max = 1,
+            minOpacity = 0.35,
+            group = "Destinations",
+            gradient = c("0.4" = "#fdd0a2", "0.65" = "#f16913", "1.0" = "#7f2704")
+         ) %>%
+         leaflet::addLayersControl(
+            overlayGroups = c("Observations", "Destinations"),
+            options = leaflet::layersControlOptions(collapsed = FALSE)
+         )
+   } else {
+      message("No destination coordinates found; only observation heatmap layer was added.")
+      detection_heatmap <- detection_heatmap %>%
+         leaflet::addLayersControl(
+            overlayGroups = c("Observations"),
+            options = leaflet::layersControlOptions(collapsed = FALSE)
+         )
+   }
+
+   htmlwidgets::saveWidget(
+      detection_heatmap,
+      file = file.path(output_dir, "nws_detections_heatmap.html"),
+      selfcontained = TRUE
+   )
+
+   cat("Saved interactive heatmap to:", file.path(output_dir, "nws_detections_heatmap.html"), "\n")
+   detection_heatmap
+} else {
+   message("leaflet.extras not installed; using hex-density fallback map.")
+
+   detections_3857 <- sf::st_transform(detection_points_all, 3857)
+   destinations_3857 <- destination_points_latlon %>%
+      sf::st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE) %>%
+      sf::st_transform(3857)
+
+   mexico_states_3857 <- sf::st_transform(mexico_states_geo, 3857)
+
+   heat_grid <- sf::st_make_grid(
+      sf::st_union(mexico_states_3857),
+      cellsize = 50000,
+      square = FALSE
+   ) %>%
+      sf::st_as_sf() %>%
+      dplyr::mutate(
+         observation_count = lengths(sf::st_intersects(., detections_3857)),
+         destination_count = lengths(sf::st_intersects(., destinations_3857))
+      ) %>%
+      dplyr::filter(observation_count > 0 | destination_count > 0) %>%
+      sf::st_transform(4326)
+
+   observation_hex <- heat_grid %>%
+      dplyr::filter(observation_count > 0)
+
+   destination_hex <- heat_grid %>%
+      dplyr::filter(destination_count > 0)
+
+   detection_heatmap <- mapview::mapview(
+      observation_hex,
+      zcol = "observation_count",
+      layer.name = "Observation heatmap (hex)",
+      lwd = 0,
+      alpha.regions = 0.7,
+      col.regions = colorRampPalette(c("#deebf7", "#4292c6", "#084594"))(8)
+   )
+
+   if (nrow(destination_hex) > 0) {
+      detection_heatmap <- detection_heatmap +
+         mapview::mapview(
+            destination_hex,
+            zcol = "destination_count",
+            layer.name = "Destination heatmap (hex)",
+            lwd = 0,
+            alpha.regions = 0.55,
+            col.regions = colorRampPalette(c("#fee6ce", "#f16913", "#7f2704"))(8)
+         )
+   } else {
+      message("No destination coordinates found; only observation hex layer was added.")
+   }
+
+   htmlwidgets::saveWidget(
+      detection_heatmap@map,
+      file = file.path(output_dir, "nws_detections_heatmap.html"),
+      selfcontained = TRUE
+   )
+
+   cat("Saved interactive heatmap to:", file.path(output_dir, "nws_detections_heatmap.html"), "\n")
+   detection_heatmap
+}
+
+```
