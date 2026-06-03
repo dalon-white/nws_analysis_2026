@@ -464,19 +464,43 @@ cat("Rejections wide table with clusters saved to:", rds_path, "and", csv_path, 
 # Heat map of rejection reasons by port and year
 ```{r heatmap}
 # Build a heatmap of rejection reasons by port and year.
-heatmap_data <- rejections_wide %>%
+heatmap_data <- rejections_wide |>
+	filter(!sample_id %in% c("san_luis_2022", "san_luis_2023", "san_luis_2024")) %>%
+	mutate(simprof_groups = if_else(is.na(simprof_groups), "Unassigned", simprof_groups)) %>%
+	dplyr::arrange(simprof_groups, sample_id)
+
+# Pivot longer for ggplot heatmap.
+heatmap_data <- heatmap_data %>%
   pivot_longer(
-	cols = -c(port, year, sample_id, simprof_group),
+	cols = -c(port, year, sample_id, simprof_groups),
 	names_to = "reason_rejected",
 	values_to = "volume"
-  )
-heatmap_plot <- ggplot(heatmap_data, aes(x = year, y = port, fill = volume)) +
+	) %>%
+	group_by(sample_id) %>%
+	mutate(
+	row_total = sum(volume, na.rm = TRUE),
+	volume_norm = if_else(row_total > 0, volume / row_total, 0)
+	) %>%
+	ungroup() %>%
+	mutate(
+		simprof_groups = factor(simprof_groups),
+		sample_id = forcats::fct_reorder(sample_id, as.numeric(simprof_groups), .fun = min)
+	)
+
+# Plot heatmap
+heatmap_plot <- ggplot(heatmap_data, aes(x = reason_rejected, y = sample_id, fill = volume_norm)) +
   geom_tile(color = "white") +
-  scale_fill_viridis_c(option = "C", na.value = "grey90") +
-  labs(title = "Heatmap of Rejection Reasons by Port and Year", x = "
-Year", y = "Port", fill = "Volume") +
-  theme_minimal()
+	facet_grid(simprof_groups ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_viridis_c(option = "C", na.value = "grey90", labels = scales::percent_format(accuracy = 1)) +
+	labs(title = "Heatmap of Rejection Reasons by Port and Year (Row-normalized)", x = "Rejection reason", y = "Sample ID", fill = "Row share") +
+  theme_minimal() +
+	theme(
+		strip.text.y = element_text(face = "bold"),
+		panel.spacing.y = unit(0.25, "lines")
+	)
+
 heatmap_fig <- here("outputs", "figures", "rejection_heatmap.png")
+
 ggsave(
 	filename = heatmap_fig,
 	plot = heatmap_plot,
