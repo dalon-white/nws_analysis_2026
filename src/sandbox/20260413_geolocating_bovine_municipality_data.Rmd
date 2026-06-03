@@ -1,0 +1,213 @@
+---
+title: "Geolocating Bovine Municipality Data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(tidyverse)
+library(sf)
+# library(stringr)
+
+```
+
+
+# Purpose: Geolocate bovine inventory data at the municipality level in Mexico.
+```{r load-mexico-geo-data}
+mexico_geo <- readRDS(here("data", "processed", "mexico_geo.rds"))
+glimpse(mexico_geo)
+```
+
+```{r load-bovine-data}
+bovine_municip_data <- readRDS(here("data", "processed", "mexico_cattle_data_2022_cleaned.rds"))
+
+glimpse(bovine_municip_data)
+View(head(bovine_municip_data))
+
+#look at matching problems
+View(
+    bovine_municip_data |> distinct(municipio) |> mutate(set = 'bovine') |> full_join(
+        mexico_geo |> st_drop_geometry()|> distinct(NOMGEO) |> mutate(set = 'georef')
+     |> rename(municipio = NOMGEO),
+        by = "municipio"
+    )
+)
+
+
+```
+
+```{r geolocate-bovine-data}
+source(here::here("src", "match_georeference.R"))
+
+bovine_municip_data_geo <- match_georeference(
+    data = bovine_municip_data,
+    georeference = mexico_geo,
+    data_state_col = "municipio",
+    data_municipality_col = "entidad_federativa_y_municipio",
+    geo_state_col = "NOMGEO",
+    geo_municipality_col = "NOMMUN",
+    geo_id_col = "CVEGEO"
+)
+
+## I replaced a print() for a View() functionfor looking at how well the match does:
+# match_georeference <- function(
+#     data,
+#     georeference,
+#     data_state_col = "State",
+#     data_municipality_col = "Municipality",
+#     geo_state_col = "NOMGEO",
+#     geo_municipality_col = "NOMMUN",
+#     geo_id_col = "CVEGEO",
+#     verbose = TRUE
+# ) {
+#     data_cols <- colnames(data)
+#     data_state_sym <- rlang::sym(data_state_col)
+#     data_municipality_sym <- rlang::sym(data_municipality_col)
+#     geo_state_sym <- rlang::sym(geo_state_col)
+#     geo_municipality_sym <- rlang::sym(geo_municipality_col)
+#     geo_id_sym <- rlang::sym(geo_id_col)
+#     temp_geo_id_sym <- rlang::sym(".geo_id")
+#     temp_geo_state_sym <- rlang::sym(".state_geo")
+#     temp_geo_municipality_sym <- rlang::sym(".municipality_geo")
+
+#     required_data_cols <- c(data_state_col, data_municipality_col)
+#     required_geo_cols <- c(geo_state_col, geo_municipality_col, geo_id_col)
+
+#     missing_data_cols <- setdiff(required_data_cols, colnames(data))
+#     missing_geo_cols <- setdiff(required_geo_cols, colnames(georeference))
+
+#     if (length(missing_data_cols) > 0) {
+#         stop("Missing required data columns: ", paste(missing_data_cols, collapse = ", "))
+#     }
+
+#     if (length(missing_geo_cols) > 0) {
+#         stop("Missing required georeference columns: ", paste(missing_geo_cols, collapse = ", "))
+#     }
+
+#     data_prepped <- data |>
+#         dplyr::mutate(
+#             .state_input = !!data_state_sym,
+#             .municipality_input = !!data_municipality_sym
+#         )
+
+#     georeference_prepped <- georeference |>
+#         dplyr::mutate(
+#             .state_geo = !!geo_state_sym,
+#             .municipality_geo = !!geo_municipality_sym,
+#             .geo_id = !!geo_id_sym
+#         )
+
+#     data_geo <- data_prepped |>
+#         dplyr::left_join(
+#             georeference_prepped,
+#             by = c(".state_input" = ".state_geo", ".municipality_input" = ".municipality_geo")
+#         )
+
+#     unknown_locations <- data_geo |>
+#         dplyr::filter(is.na(!!temp_geo_id_sym)) |>
+#         dplyr::select(dplyr::all_of(data_cols)) |>
+#         dplyr::mutate(
+#             Municipality_plain = stringi::stri_trans_general(!!data_municipality_sym, "Latin-ASCII"),
+#             State_plain = stringi::stri_trans_general(!!data_state_sym, "Latin-ASCII")
+#         )
+
+#     georeference_plain <- georeference_prepped |>
+#         dplyr::mutate(
+#             NOMMUN_plain = stringi::stri_trans_general(!!temp_geo_municipality_sym, "Latin-ASCII"),
+#             NOMGEO_plain = stringi::stri_trans_general(!!temp_geo_state_sym, "Latin-ASCII")
+#         )
+
+#     data_geo_plain <- unknown_locations |>
+#         dplyr::left_join(
+#             georeference_plain,
+#             by = c("State_plain" = "NOMGEO_plain", "Municipality_plain" = "NOMMUN_plain")
+#         )
+
+#     if (isTRUE(verbose)) {
+#         cat("Unmatched locations after plain text join:\n")
+#         View(
+#             data_geo_plain |>
+#                 dplyr::filter(is.na(!!geo_id_sym)) |>
+#                 dplyr::count(
+#                     !!data_state_sym,
+#                     !!data_municipality_sym,
+#                     sort = TRUE,
+#                     name = "n"
+#                 )
+#         )
+#     }
+
+#     data_geo_plain <- data_geo_plain |>
+#         dplyr::filter(!is.na(!!geo_id_sym)) |>
+#         dplyr::select(-dplyr::any_of(c("Municipality_plain", "State_plain")))
+
+#     dplyr::bind_rows(
+#         data_geo |> dplyr::filter(!is.na(!!temp_geo_id_sym)),
+#         data_geo_plain
+#     ) |>
+#         dplyr::select(-dplyr::any_of(c(".state_input", ".municipality_input", ".state_geo", ".municipality_geo", ".geo_id")))
+# }
+```
+
+```{r unmatched-locations}
+## If looking at how specific non-matches might be mismatched:
+
+# mexico_geo |> filter(str_detect(NOMMUN, "villa hidalgo"))
+# #theres a villa hidalgo yalálag
+
+# mexico_geo |> filter(str_detect(NOMMUN, "san juan mixtepec")) |> filter(NOMGEO == 'oaxaca')
+# #rename the san juan municipalities in Oaxaca in the bovine data to match  -dto. 08-/26
+
+# mexico_geo |> filter(str_detect(NOMMUN, "san pedro mixtepec")) |> filter(NOMGEO == 'oaxaca')
+# # same needed for san pedro municipalities in Oaxaca
+
+# mexico_geo |> filter(str_detect(NOMMUN, "san martín de")) |> filter(NOMGEO == 'oaxaca')
+# # san martin starts with 'heroico': heroico san martín de los cansecos
+
+# mexico_geo |> filter(str_detect(NOMMUN, "cintalapa")) |> filter(NOMGEO == 'chiapas')
+# # cintalapa is in Chiapas; I thought the mexico_geo data already had this renamed?
+
+```
+
+# summarize by state
+```{r summarize-by-state}
+# Summarize bovine data by state
+bovine_state_data <- bovine_municip_data |>
+    group_by(municipio) |>
+    summarise(across(where(is.numeric), \(x) sum(x, na.rm = TRUE)), .groups = "drop")
+
+mexico_state_geo <- readRDS(here::here('data','processed','mexico_states_geo.rds'))
+
+bovine_state_data_geo <- match_georeference(
+    data = bovine_state_data,
+    georeference = mexico_state_geo,
+    data_state_col = "municipio",
+    data_municipality_col = NULL,
+    geo_state_col = "NOMGEO",
+    geo_municipality_col = NULL,
+    geo_id_col = "CVEGEO"
+)
+
+
+```
+
+# save data
+```{r save-data}
+output_folder <- here::here('data','processed')
+output_csv <- "geolocated_bovine_data.csv"
+output_rds <- "geolocated_bovine_data.rds"
+output_geojson <- "geolocated_bovine_data.geojson"
+
+write.csv(bovine_municip_data_geo, file.path(output_folder, output_csv))
+saveRDS(bovine_municip_data_geo, file.path(output_folder, output_rds))
+sf::st_write(bovine_municip_data_geo, file.path(output_folder, output_geojson), delete_dsn = TRUE)
+
+# save state summary
+output_csv <- "geolocated_bovine_state_summary.csv"
+output_rds <- "geolocated_bovine_state_summary.rds"
+output_geojson <- "geolocated_bovine_state_summary.geojson"
+write.csv(bovine_state_data_geo, file.path(output_folder, output_csv))
+saveRDS(bovine_state_data_geo, file.path(output_folder, output_rds))
+sf::st_write(bovine_state_data_geo, file.path(output_folder, output_geojson), delete_dsn = TRUE)
+```

@@ -13,34 +13,22 @@ library(viridis)
 library(effectsize)
 ```
 
+# idnetify data folder
+```{r define data folder}
+data_path <- here("data", "processed")
+```
 ## Load Data
 
 ```{r load volume data}
-# Read the rejected_cattle tab of the Excel file.
-port_volume <- read_xlsx(
-	here("data", "raw", "cattle port data.xlsx"),
-	sheet = "volume_cattle"
-)
-
+# Read the port volume data from RDS file.
+port_volume <- readRDS(file.path(data_path, "port_volume.rds"))
 glimpse(port_volume)
 ```
 
-```{r load and simplify rejection reasons}
-rejections <- read_xlsx(
-	here("data", "raw", "cattle port data.xlsx"),
-	sheet = "rejected_cattle"
-)
+# load rejections by port and year
 
-# Filter to only include rows where elevated_nws_risk is "yes", then group by port and year, and sum the volume of rejections.
-rejections <- rejections |>
-    filter(elevated_nws_risk == "yes") |>
-    group_by(port, year) |>
-    summarise(rejections = sum(volume, na.rm = TRUE), .groups = "drop")
-
-# filter out san luis which never had any shipments
-rejections <- rejections |>
-    filter(port != "san_luis")
-
+```{r load rejects by port and year}
+rejections <- readRDS(file.path(data_path, "rejections_by_port_year.rds"))
 glimpse(rejections)
 ```
 
@@ -58,6 +46,32 @@ rejections_volume <- rejections_volume %>%
     mutate(across(c(port, year), as.factor))
 
 glimpse(rejections_volume)
+```
+
+## View rejection volue by port and year
+
+```{r plot rejection volume}
+rej_volume_plot <- ggplot(rejections_volume, aes(x = port, y = rejections, color = year)) +
+   geom_boxplot(aes(group = port)) +
+    geom_line() +
+    geom_point() +
+    labs(title = "Rejections by Port and Year", x = "Port", y = "# of Rejections") +
+    theme_minimal()
+
+rej_volume_plot <- rej_volume_plot +
+  scale_color_viridis_d(option = "D")
+
+rej_volume_fig <- here("outputs", "figures", "rejection_volume.png")
+ggsave(
+	filename = rej_volume_fig,
+	plot = rej_volume_plot,
+	width = 10,
+	height = 7,
+	dpi = 150
+)
+
+cat("Rejection volume figure saved to:", rej_volume_fig, "\n")
+knitr::include_graphics(rej_volume_fig)
 ```
 
 ## View rejection rates by port (factor) and year (x-axis)
@@ -141,14 +155,19 @@ cat("ANOVA assumptions visualization saved to:", assumptions_fig, "\n")
 rejections_volume <- rejections_volume %>%
     mutate(year_numeric = as.numeric(as.character(year)))
 
-fit <- lm(rejection_rate_4th_root ~ port * year_numeric, data = rejections_volume)
+fit <- lm(rejection_rate_4th_root ~ port + year, data = rejections_volume)
 anova_result <- aov(fit)
 summary(anova_result)
 
 broom::tidy(fit)
 
 TukeyHSD(anova_result, "port")
+emm_port <- emmeans::emmeans(fit, ~ port)
+contrast(emm_port, method = "tukey")
 
+TukeyHSD(anova_result, "year")
+emm_year <- emmeans::emmeans(fit, ~ year)
+contrast(emm_year, method = "tukey")
 
 ```
 
@@ -257,8 +276,8 @@ rejection_rates_with_tukey <- rejections_volume %>%
 
 ```{r save-rejection-rates}
 #save summary of rejection rates by port and year
-rejection_rates_csv <- here("outputs", "data", "rejection_rates.csv")
-rejection_rates_rds <- here("outputs", "data", "rejection_rates.rds")
+rejection_rates_csv <- here("data", "processed", "rejection_rates.csv")
+rejection_rates_rds <- here("data", "processed", "rejection_rates.rds")
 
 write_csv(rejections_volume, rejection_rates_csv)
 saveRDS(rejections_volume, rejection_rates_rds)
@@ -266,8 +285,8 @@ saveRDS(rejections_volume, rejection_rates_rds)
 cat("Rejection rates data saved to:", rejection_rates_csv, "and", rejection_rates_rds, "\n")
 
 # Save mean rejection rates with Tukey's groupings
-mean_rejection_rates_csv <- here("outputs", "data", "mean_rejection_rates_with_tukey.csv")
-mean_rejection_rates_rds <- here("outputs", "data", "mean_rejection_rates_with_tukey.rds")
+mean_rejection_rates_csv <- here("data", "processed", "mean_rejection_rates_with_tukey.csv")
+mean_rejection_rates_rds <- here("data", "processed", "mean_rejection_rates_with_tukey.rds")
 
 write_csv(rejection_rates_with_tukey, mean_rejection_rates_csv)
 saveRDS(rejection_rates_with_tukey, mean_rejection_rates_rds)

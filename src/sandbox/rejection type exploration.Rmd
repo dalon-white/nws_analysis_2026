@@ -20,35 +20,11 @@ if (!requireNamespace("clustsig", quietly = TRUE)) {
 ## Load Data
 
 ```{r load-data}
-# Read the rejected_cattle tab of the Excel file.
-rejections <- read_xlsx(
-	here("data", "raw", "cattle port data.xlsx"),
-	sheet = "rejected_cattle"
-)
+# Start with processed rejection data by type
+rejections <- readRDS(file.path(here("data", "processed"), "rejections_by_type.rds"))
 
 glimpse(rejections)
 ```
-
-```{r simplify rejection reasons}
-#load in rejection reason key
-rejection_reason_key <- read_xlsx(
-    here("data", "raw", "cattle port data.xlsx"),
-    sheet = "at_risk_reasoning"
-)
-#This isn't necessary but can be used to further delineate groups; just leaving it here for now.
-
-#combine any elevated_nws_risk == 'no' into a reason_rejected == 'not_nws_risk'
-
-rejections <- rejections |>
-    mutate(reason_rejected = if_else(
-        elevated_nws_risk == "no",
-        "not_nws_risk",
-        reason_rejected
-    )) |>
-    group_by(port, year, reason_rejected) |>
-    summarise(volume = sum(volume, na.rm = TRUE), .groups = "drop")
-```
-
 
 ## Prepare Community Matrix (Pivot Wider)
 
@@ -75,10 +51,10 @@ rejections_wide <- rejections_wide %>%
 
 # Preserve sample metadata and extract numeric species matrix.
 sample_meta <- rejections_wide %>%
-	select(sample_id, port, year)
+	dplyr::select(sample_id, port, year)
 
 community <- rejections_wide %>%
-	select(-port, -year) %>%
+	dplyr::select(-port, -year, -sample_id) %>%
 	mutate(across(everything(), ~ replace_na(.x, 0))) %>%
 	as.data.frame()
 
@@ -251,48 +227,6 @@ cat("nMDS figure saved to:", nmds_fig, "\n")
 knitr::include_graphics(nmds_fig)
 ```
 
-## nMDS Colored By SIMPROF Group
-
-```{r nmds-simprof}
-# Merge SIMPROF group assignments with nMDS scores
-nmds_scores <- as.data.frame(scores(nmds, display = "sites")) %>%
-  mutate(sample_id = rownames(.))
-
-# Ensure cluster_df is a data frame with proper column names
-cluster_df <- as.data.frame(cluster_df)
-colnames(cluster_df) <- c("sample_id", "simprof_groups")
-
-# Merge nMDS scores with SIMPROF group assignments
-nmds_scores <- nmds_scores %>%
-  left_join(cluster_df, by = "sample_id")
-
-# Create nMDS plot colored by SIMPROF groups
-nmds_simprof_plot <- ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, color = as.factor(simprof_groups))) +
-  geom_point(size = 3, alpha = 0.9) +
-  geom_text(aes(label = sample_id), size = 3, hjust = 0.5, vjust = -0.5, check_overlap = TRUE) +
-  theme_minimal(base_size = 12) +
-  labs(
-    title = "nMDS of Rejection Composition Colored by SIMPROF Groups",
-    x = "NMDS1",
-    y = "NMDS2",
-    color = "SIMPROF Group"
-  ) +
-  scale_color_viridis_d(option = "D")
-
-# Save the plot
-nmds_simprof_fig <- here("outputs", "figures", "rejection_nmds_simprof.png")
-ggsave(
-  filename = nmds_simprof_fig,
-  plot = nmds_simprof_plot,
-  width = 10,
-  height = 7,
-  dpi = 150
-)
-
-cat("nMDS SIMPROF-colored figure saved to:", nmds_simprof_fig, "\n")
-knitr::include_graphics(nmds_simprof_fig)
-```
-
 ## Cluster Analysis (Hierarchical)
 
 ```{r cluster-analysis}
@@ -374,6 +308,49 @@ for (i in seq_along(simprof_res$significantclusters)) {
         simprof_group = groups
     )
 }
+```
+
+
+## nMDS Colored By SIMPROF Group
+
+```{r nmds-simprof}
+# Merge SIMPROF group assignments with nMDS scores
+nmds_scores <- as.data.frame(scores(nmds, display = "sites")) %>%
+  mutate(sample_id = rownames(.))
+
+# Ensure cluster_df is a data frame with proper column names
+cluster_df <- as.data.frame(cluster_df)
+colnames(cluster_df) <- c("sample_id", "simprof_groups")
+
+# Merge nMDS scores with SIMPROF group assignments
+nmds_scores <- nmds_scores %>%
+  left_join(cluster_df, by = "sample_id")
+
+# Create nMDS plot colored by SIMPROF groups
+nmds_simprof_plot <- ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, color = as.factor(simprof_groups))) +
+  geom_point(size = 3, alpha = 0.9) +
+  geom_text(aes(label = sample_id), size = 3, hjust = 0.5, vjust = -0.5, check_overlap = TRUE) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "nMDS of Rejection Composition Colored by SIMPROF Groups",
+    x = "NMDS1",
+    y = "NMDS2",
+    color = "SIMPROF Group"
+  ) +
+  scale_color_viridis_d(option = "D")
+
+# Save the plot
+nmds_simprof_fig <- here("outputs", "figures", "rejection_nmds_simprof.png")
+ggsave(
+  filename = nmds_simprof_fig,
+  plot = nmds_simprof_plot,
+  width = 10,
+  height = 7,
+  dpi = 150
+)
+
+cat("nMDS SIMPROF-colored figure saved to:", nmds_simprof_fig, "\n")
+knitr::include_graphics(nmds_simprof_fig)
 ```
 
 ## PCA Biplot Colored By SIMPROF Group
@@ -484,3 +461,28 @@ cat("Rejections wide table with clusters saved to:", rds_path, "and", csv_path, 
 ```
 
 
+# Heat map of rejection reasons by port and year
+```{r heatmap}
+# Build a heatmap of rejection reasons by port and year.
+heatmap_data <- rejections_wide %>%
+  pivot_longer(
+	cols = -c(port, year, sample_id, simprof_group),
+	names_to = "reason_rejected",
+	values_to = "volume"
+  )
+heatmap_plot <- ggplot(heatmap_data, aes(x = year, y = port, fill = volume)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "C", na.value = "grey90") +
+  labs(title = "Heatmap of Rejection Reasons by Port and Year", x = "
+Year", y = "Port", fill = "Volume") +
+  theme_minimal()
+heatmap_fig <- here("outputs", "figures", "rejection_heatmap.png")
+ggsave(
+	filename = heatmap_fig,
+	plot = heatmap_plot,
+	width = 10,
+	height = 7,
+	dpi = 150
+)
+knitr::include_graphics(heatmap_fig)
+```

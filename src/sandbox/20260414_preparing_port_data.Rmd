@@ -1,0 +1,97 @@
+---
+title: "Preparing Port Data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(tidyverse)
+library(readxl)
+```
+
+# summary of cattle volume by port and mexican state
+```{r}
+port_volume_by_state <- read_xlsx(
+	here("data", "raw", "cattle port state and bovine type 2023 to 2024.xlsx")
+)
+port_volume_by_state <- port_volume_by_state |> dplyr::select(-san_luis)
+
+port_volume_by_state <- port_volume_by_state |>
+pivot_longer(cols = 5:ncol(port_volume_by_state), names_to = "port", values_to = "volume")
+
+port_volume_by_state <- port_volume_by_state |>
+    mutate(across(where(is.character), ~tolower(.)))
+
+port_volume_by_state <- port_volume_by_state |>
+	group_by(year, port, state) |>
+	summarise(total_volume = sum(volume, na.rm = TRUE), .groups = "drop")
+
+glimpse(port_volume_by_state)
+
+# save data
+saveRDS(port_volume_by_state, here("data", "processed", "port_volume_by_state.rds"))
+write.csv(port_volume_by_state, here("data", "processed", "port_volume_by_state.csv"), row.names = FALSE)
+
+```
+
+
+## save cattle volume data
+```{r load volume data}
+# Read the rejected_cattle tab of the Excel file.
+port_volume <- read_xlsx(
+	here("data", "raw", "cattle port data.xlsx"),
+	sheet = "volume_cattle"
+)
+
+glimpse(port_volume)
+saveRDS(port_volume, here("data", "processed", "port_volume.rds"))
+write.csv(port_volume, here("data", "processed", "port_volume.csv"), row.names = FALSE)
+```
+
+## save rejected at-risk cattle data by port and year
+```{r load-data}
+# Read the rejected_cattle tab of the Excel file.
+rejections <- read_xlsx(
+	here("data", "raw", "cattle port data.xlsx"),
+	sheet = "rejected_cattle"
+)
+
+# Filter to only include rows where elevated_nws_risk is "yes", then group by port and year, and sum the volume of rejections.
+rejections_at_risk <- rejections |>
+    filter(elevated_nws_risk == "yes") |>
+    group_by(port, year) |>
+    summarise(rejections = sum(volume, na.rm = TRUE), .groups = "drop")
+
+# filter out san luis which never had any shipments
+rejections_at_risk <- rejections_at_risk |>
+    filter(port != "san_luis")
+
+glimpse(rejections_at_risk)
+saveRDS(rejections_at_risk, here("data", "processed", "rejections_by_port_year.rds"))
+write.csv(rejections_at_risk, here("data", "processed", "rejections_by_port_year.csv"), row.names = FALSE)
+```
+
+## save at-risk rejections by rejection type
+```{r simplify rejection reasons}
+#load in rejection reason key
+rejection_reason_key <- read_xlsx(
+    here("data", "raw", "cattle port data.xlsx"),
+    sheet = "at_risk_reasoning"
+)
+#This isn't necessary but can be used to further delineate groups; just leaving it here for now.
+
+#combine any elevated_nws_risk == 'no' into a reason_rejected == 'not_nws_risk'
+    #start with the raw rejections data
+rejections_by_type <- rejections |>
+    mutate(reason_rejected = if_else(
+        elevated_nws_risk == "no",
+        "not_nws_risk",
+        reason_rejected
+    )) |>
+    group_by(port, year, reason_rejected) |>
+    summarise(volume = sum(volume, na.rm = TRUE), .groups = "drop")
+
+saveRDS(rejections_by_type, here("data", "processed", "rejections_by_type.rds"))
+write.csv(rejections_by_type, here("data", "processed", "rejections_by_type.csv"), row.names = FALSE)
+```

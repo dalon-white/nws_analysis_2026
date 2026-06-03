@@ -142,53 +142,12 @@ saveRDS(mexico_geo, here("data", "processed", "mexico_geo.rds"))
 
 ## Create singular approach for matching the georeference data to the detections data
 ```{r create singular approach for matching georeference data}
-# create a function that takes in the detections data and the georeference data and returns the detections data with the georeference data joined on
-match_georeference <- function(detections, georeference) {
-    detections_cols <- colnames(detections)
+source(here("src", "match_georeference.R"))
 
-    detections_geo <- detections %>%
-        dplyr::left_join(georeference, by = c("State" = "NOMGEO", "Municipality" = "NOMMUN"))
-
-    unknown_locations <- detections_geo |>
-        dplyr::filter(is.na(CVEGEO)) |>
-        dplyr::select(dplyr::all_of(detections_cols)) |>
-        dplyr::mutate(
-            Municipality_plain = stri_trans_general(Municipality, "Latin-ASCII"),
-            State_plain = stri_trans_general(State, "Latin-ASCII")
-        )
-
-    georeference_plain <- georeference %>%
-        dplyr::mutate(
-            NOMMUN_plain = stri_trans_general(NOMMUN, "Latin-ASCII"),
-            NOMGEO_plain = stri_trans_general(NOMGEO, "Latin-ASCII")
-        )
-
-    detections_geo_plain <- unknown_locations |>
-        dplyr::left_join(
-            georeference_plain,
-            by = c("State_plain" = "NOMGEO_plain", "Municipality_plain" = "NOMMUN_plain")
-        )
-
-    cat("Unmatched locations after plain text join:\n")
-    print(
-        detections_geo_plain |>
-            dplyr::group_by(State, Municipality) |>
-            dplyr::filter(is.na(CVEGEO)) |>
-            dplyr::count() |>
-            dplyr::arrange(dplyr::desc(n))
-    )
-
-    detections_geo_plain <- detections_geo_plain |>
-        dplyr::filter(!is.na(CVEGEO)) |>
-        dplyr::select(-dplyr::any_of(c("Municipality_plain", "State_plain")))
-
-    dplyr::bind_rows(
-        detections_geo |> dplyr::filter(!is.na(CVEGEO)),
-        detections_geo_plain
-    )
-}
-
-detections_geo_final <- match_georeference(nws_detections, mexico_geo)
+detections_geo_final <- match_georeference(
+    data = nws_detections,
+    georeference = mexico_geo
+)
 
 # save matched detections to processed data folder
 sf::st_write(

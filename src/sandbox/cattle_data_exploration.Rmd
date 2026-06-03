@@ -1,0 +1,115 @@
+---
+title: "Cattle Data Exploration"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(readr)
+library(dplyr)
+library(stringr)
+```
+
+```{r paths}
+input_path <- "data/raw/mexico_cattle_data_2022.csv"
+output_csv <- "data/processed/mexico_cattle_data_2022_cleaned.csv"
+output_rds <- "data/processed/mexico_cattle_data_2022_cleaned.rds"
+```
+
+```{r load-data}
+message("Loading data from file: ", input_path)
+df <- read_csv(input_path, locale = locale(encoding = "Latin1"), show_col_types = FALSE)
+```
+
+```{r clean-data}
+
+#remove leading and trailing whitespaces
+df <- df |> mutate(across(everything(), ~ trimws(.x)))
+
+#set names to lower
+df <- df |> mutate(across(`Entidad federativa`:`Entidad federativa y municipio`, ~ tolower(.x)))
+
+#remove the total row
+df <- df |> filter(`Entidad federativa` != "00 nal")
+
+#rename columns with _ for spaces and make lowercase
+df <- df |>
+    rename_with(~ gsub(" ", "_", .x, fixed = TRUE)) |> 
+    rename_with(~ tolower(.x))
+
+#remove the last column
+df <- df |> dplyr::select(-`...12`)
+
+# Make numeric columns 4 through 11.
+df <- df %>%
+  mutate(
+    across(
+      .cols = 4:11,
+      .fns = ~ as.numeric(gsub(" ", "", as.character(.x), fixed = TRUE))
+    )
+  )
+
+glimpse(df)
+```
+
+# Rename some places that have been determined to be problematic
+
+```{r rename-problematic-places}
+# Modify town names
+
+#shorten to villa de tututepec, oaxaca to match the detections data, which has it as villa de tututepec, oaxaca
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "villa de tututepec")) |> distinct(entidad_federativa_y_municipio))
+df <- df |> mutate(entidad_federativa_y_municipio = if_else(str_detect(entidad_federativa_y_municipio, "villa de tututepec"), "villa de tututepec", entidad_federativa_y_municipio))
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "villa de tututepec")) |> distinct(entidad_federativa_y_municipio))
+
+
+#Shorten to cintalapa, chiapas to match the detections data, which has it as cintalapa, chiapas
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "cintalapa")) |> distinct(entidad_federativa_y_municipio))
+df <- df |> mutate(entidad_federativa_y_municipio = if_else(str_detect(entidad_federativa_y_municipio, "cintalapa"), "cintalapa", entidad_federativa_y_municipio))
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "cintalapa")) |> distinct(entidad_federativa_y_municipio))
+
+
+#theres a villa hidalgo yalálag in oaxaca; be specific cause other villa hidalgo's exist in other states
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "villa hidalgo")) |> distinct(entidad_federativa_y_municipio))
+df <- df |> mutate(entidad_federativa_y_municipio = if_else(str_detect(entidad_federativa_y_municipio, "villa hidalgo") & str_detect(municipio, "oaxaca"), "villa hidalgo yalálag", entidad_federativa_y_municipio))
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "villa hidalgo")) |> distinct(entidad_federativa_y_municipio))
+
+#rename the san juan municipalities in Oaxaca in the bovine data to match  -dto. 08-/26
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "san juan mixtepec")) |> distinct(entidad_federativa_y_municipio))
+df <- df |> mutate(entidad_federativa_y_municipio = if_else(str_detect(entidad_federativa_y_municipio, "san juan mixtepec distrito 08"), "san juan mixtepec -dto. 08-", entidad_federativa_y_municipio))
+df <- df |> mutate(entidad_federativa_y_municipio = if_else(str_detect(entidad_federativa_y_municipio, "san juan mixtepec distrito 26"), "san juan mixtepec -dto. 26-", entidad_federativa_y_municipio))
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "san juan mixtepec")) |> distinct(entidad_federativa_y_municipio))
+
+#rename the san pedro municipalities in Oaxaca in the bovine data to match  -dto. 22-/26
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "san pedro mixtepec")) |> distinct(entidad_federativa_y_municipio))
+df <- df |> mutate(entidad_federativa_y_municipio = if_else(str_detect(entidad_federativa_y_municipio, "san pedro mixtepec distrito 22"), "san pedro mixtepec -dto. 22-", entidad_federativa_y_municipio))
+df <- df |> mutate(entidad_federativa_y_municipio = if_else(str_detect(entidad_federativa_y_municipio, "san pedro mixtepec distrito 26"), "san pedro mixtepec -dto. 26-", entidad_federativa_y_municipio))
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "san pedro mixtepec")) |> distinct(entidad_federativa_y_municipio))
+
+#san martin de los canceos
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "san martín de")) |> distinct(entidad_federativa_y_municipio))
+df <- df |> mutate(entidad_federativa_y_municipio = if_else(str_detect(entidad_federativa_y_municipio, "san martín de los cansecos"), "heroico san martín de los cansecos", entidad_federativa_y_municipio))
+print(df |> filter(str_detect(entidad_federativa_y_municipio, "san martín de")) |> distinct(entidad_federativa_y_municipio))
+
+# Modify state names
+
+#Shorten veracruz to veracruz to match the detections data, which has it as veracruz
+print(df |> filter(str_detect(municipio, "veracruz")) |> distinct(municipio))
+df <- df |> mutate(municipio = if_else(str_detect(municipio, "veracruz"), "veracruz", municipio))
+print(df |> filter(str_detect(municipio, "veracruz")) |> distinct(municipio))
+
+
+```
+
+```{r save-outputs}
+dir.create(dirname(output_csv), recursive = TRUE, showWarnings = FALSE)
+
+write_csv(df, output_csv)
+saveRDS(df, output_rds)
+
+message("Processed data saved to CSV: ", output_csv)
+message("Processed data saved to RDS: ", output_rds)
+```

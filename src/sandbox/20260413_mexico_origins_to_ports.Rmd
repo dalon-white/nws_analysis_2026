@@ -1,0 +1,292 @@
+---
+title: "Mexico Origins to Ports"
+output: html_document
+---
+
+# Purpose: Explore the data on ports and Mexico state origins.
+
+
+ - going to need the bovines per municipality data
+    - Needs to be geolocated as well
+ - imports by mexican state and port per year
+
+# Quantify:
+    - Connections (volume of import) between state and port
+    - Percent of state inventory moving to each port
+    - Proportions of detections relative to state inventory
+    - Proportion of infested transports to state inventory
+
+
+# setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(tidyverse)
+library(sf)
+library(stringi)
+```
+
+# Load georeferenced bovine data by state
+```{r summarize-bovine-by-state}
+bovine_state_summary <- readRDS(here("data", "processed", "geolocated_bovine_state_summary.rds"))
+glimpse(bovine_state_summary)
+```
+
+# Load port data
+
+```{r load-port-data}
+port_volume_by_state <- readRDS(here("data", "processed", "port_volume_by_state.rds"))
+glimpse(port_volume_by_state)
+```
+
+
+#    - Percent of state inventory moving to each port
+```{r percent-state-inventory-to-port}
+normalize_state_name <- function(x) {
+    x |>
+        stringi::stri_trans_general("Latin-ASCII") |>
+        stringr::str_to_lower() |>
+        stringr::str_replace_all("[^a-z0-9]+", " ") |>
+        stringr::str_squish()
+}
+
+## Align state names between the two processed datasets.
+#state_name_overrides <- c(
+#    "michioacan" = "michoacan",
+#    "distrito federal" = "ciudad de mexico",
+#    "mexico" = "estado de mexico"
+#)
+
+port_state_clean <- port_volume_by_state |>
+    mutate(
+        state_norm = normalize_state_name(state)
+        #,
+        #state_norm = recode(state_norm, !!!state_name_overrides)
+    )
+
+bovine_state_clean <- bovine_state_summary |>
+    sf::st_drop_geometry() |>
+    transmute(
+        state = municipio,
+        total_state_bovine = total_de_bovinos,
+        state_norm = normalize_state_name(municipio)
+    )
+
+state_port_joined <- port_state_clean |>
+    left_join(
+        bovine_state_clean,
+        by = "state_norm",
+        relationship = "many-to-one"
+    ) |> rename(total_port_volume = total_volume)
+
+unmatched_states <- state_port_joined |>
+    filter(is.na(total_state_bovine)) |>
+    distinct(state = state.x, state_norm) |>
+    arrange(state)
+
+unmatched_states
+
+# 1) Total volume from each state to each port.
+state_to_port_total_volume <- state_port_joined |>
+    transmute(
+        year,
+        state = coalesce(state.y, state.x),
+        port,
+        total_port_volume
+    ) |>
+    arrange(year, state, port)
+
+state_to_port_total_volume_wide <- state_to_port_total_volume |>
+    pivot_wider(
+        names_from = port,
+        values_from = total_port_volume,
+        values_fill = 0
+    ) |>
+    arrange(year, state)
+
+state_to_port_total_volume_wide
+
+# 2) Total volume from each state to each port divided by total bovine in each state.
+state_to_port_volume_per_bovine <- state_port_joined |>
+    transmute(
+        year,
+        state = coalesce(state.y, state.x),
+        port,
+        total_port_volume,
+        total_state_bovine,
+        port_volume_per_bovine = if_else(total_state_bovine > 0, total_port_volume / total_state_bovine, NA_real_)
+    ) |>
+    arrange(year, state, port)
+
+state_to_port_volume_per_bovine_wide <- state_to_port_volume_per_bovine |>
+    select(year, state, port, port_volume_per_bovine) |>
+    pivot_wider(
+        names_from = port,
+        values_from = port_volume_per_bovine,
+        values_fill = 0
+    ) |>
+    arrange(year, state)
+
+state_to_port_volume_per_bovine_wide
+
+write.csv(
+    state_to_port_total_volume,
+    here("outputs", "tables", "state_to_port_total_volume.csv"),
+    row.names = FALSE
+)
+
+write.csv(
+    state_to_port_volume_per_bovine,
+    here("outputs", "tables", "state_to_port_volume_per_bovine.csv"),
+    row.names = FALSE
+)
+
+
+print("Come back to these that are not matched!!:")
+print(unmatched_states)
+
+```
+
+# Combine the at-risk rate per port
+
+```{r combine-at-risk-rate-per-port}
+# rejection_rates <- readRDS(here("data", "processed", "mean_rejection_rates_with_tukey.rds"))
+# glimpse(rejection_rates)
+
+# state_to_port_tmp <- state_to_port_volume_per_bovine |> 
+# dplyr::left_join(rejection_rates, by = "port")
+
+# explore using rejection rate by year instead
+rejection_rates_yr <- readRDS(here("data", "processed", "rejection_rates.rds"))
+rejection_rates_yr <- rejection_rates_yr |> 
+    mutate(year = as.numeric(as.character(year)))
+state_to_port_tmp <- state_to_port_volume_per_bovine |> 
+dplyr::left_join(rejection_rates_yr, by = c("port", "year"))
+
+glimpse(state_to_port_tmp)
+```
+
+```{r add-detections}
+detections <- readRDS(here("data", "processed", "nws_detections.rds"))
+glimpse(detections)
+
+
+#summarize detections by state
+detections_by_state <- detections |>
+    group_by(State) |>
+    summarise(total_detections = n())
+
+glimpse(detections_by_state)
+
+state_to_port_tmp <- state_to_port_tmp |>
+    left_join(detections_by_state, by = c("state" = "State"))
+
+glimpse(state_to_port_tmp)
+
+state_to_port_tmp <- state_to_port_tmp |>
+    mutate(total_detections = replace_na(total_detections, 0))
+
+glimpse(state_to_port_tmp)
+```
+
+```{r add destination to detections}
+# Detection data doesn't account for movement. Add the destination of the detection to the state
+transport <- read.csv(
+    here("data", "processed", "nws_detections_transport.csv")
+)
+glimpse(transport)
+
+transport <- transport |>
+    group_by(destination_matched_state) |>
+    summarise(n_traveling_to = n())
+
+state_to_port_tmp <- state_to_port_tmp |>
+    left_join(transport, by = c("state" = "destination_matched_state")) |>
+    mutate(n_traveling_to = replace_na(n_traveling_to, 0))
+
+state_to_port_tmp <- state_to_port_tmp |> 
+    mutate(detections_at_or_to = total_detections + n_traveling_to)
+
+glimpse(state_to_port_tmp)
+```
+
+# use proportional allocation to determine the rate of at-risk bovine in each area
+
+
+# Calculate the proportion of each port's volume by state
+ - Turn it into a matrix and calcualte the proportion of the sum
+
+ ```{r proportion of port volume by state}
+state_prop <- state_to_port_tmp |>
+    dplyr::select(year, state, port, total_port_volume) |>
+    ungroup() |>
+    pivot_wider(
+        names_from = state,
+        values_from = total_port_volume
+    )
+
+state_prop <- state_prop |>
+    mutate(across(-c(year, port), ~ .x / sum(.x, na.rm = TRUE))) |>
+    mutate(across(-c(year, port), ~ replace_na(.x, 0)))
+
+# pivot_longer and match
+state_prop <- state_prop |>
+    pivot_longer(
+        cols = -c(year, port),
+        names_to = "state",
+        values_to = "proportion_port_volume"
+    )
+
+state_to_port_tmp2 <- state_to_port_tmp |>
+    left_join(state_prop, by = c("year", "port", "state"))
+glimpse(state_to_port_tmp2)
+View(state_to_port_tmp2)
+ ```
+
+# calculate the estimated state-wide at-risk bovine
+```{r rejection-rate-by-state}
+state_rate <- state_to_port_tmp2 |>
+    mutate(estimated_state_rate = proportion_port_volume * rejection_rate) |>
+    group_by(state, year) |>
+    summarise(estimated_state_rate = sum(estimated_state_rate, na.rm = TRUE))
+
+glimpse(state_rate)
+View(state_rate)
+```
+
+
+
+# Formalize the final dataset
+```{r formalize-final-dataset}
+state_to_port_tmp2 <- state_to_port_tmp2 |> left_join(state_rate, by = c("state", "year"))
+
+
+state_to_port_final <- state_to_port_tmp2
+glimpse(state_to_port_final)
+View(state_to_port_final)
+
+# Write to final output tables
+saveRDS(
+    state_to_port_final,
+    here("outputs", "tables", "state_to_port_final.rds")
+)
+
+write.csv(
+    state_to_port_final,
+    here("outputs", "tables", "state_to_port_final.csv"),
+    row.names = FALSE
+)
+
+# Write to processed data folder
+
+saveRDS(
+    state_to_port_final,
+    here("data", "processed", "state_to_port_final.rds")
+)
+write.csv(
+    state_to_port_final,
+    here("data", "processed", "state_to_port_final.csv"),
+    row.names = FALSE
+)
+```

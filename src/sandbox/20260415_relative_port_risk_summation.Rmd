@@ -1,0 +1,111 @@
+---
+title: "Relative Port Risk Summation"
+output: html_document
+---
+
+# Purpose: To summarize the port and state data into a singular measure of relative risk per port
+# Alternative: View in a multivariate approach like principal component analysis (PCA) or clustering to assess relative risk patterns across ports and states
+
+# Summarize a single measure:
+```{r combine-values}
+library(here)
+library(tidyverse)
+
+state_to_port_final <- readRDS(here("data", "processed", "state_to_port_final.rds"))
+
+relative_port_risk <- state_to_port_final |>
+    mutate(
+        relative_port_risk = 
+        #percent of state exported; how many are going to each port
+        (total_port_volume / total_state_bovine)
+        *
+        #total estimated at-risk cows; as a relative measure of the infestation level
+        (detections_at_or_to / total_state_bovine)
+        *
+        #state at-risk cows
+        (estimated_state_rate * total_state_bovine)
+    ) |>
+    group_by(port, year) |>
+    summarise(
+        relative_port_risk = sum(relative_port_risk, na.rm = TRUE),
+        .groups = "drop"
+    ) |>
+    group_by(port) |>
+    summarise(
+        relative_port_risk = mean(relative_port_risk, na.rm = TRUE),
+        .groups = "drop"
+    ) |>
+    arrange(desc(relative_port_risk))
+
+total_chunks <- 10
+
+relative_port_risk_chunks <- relative_port_risk |>
+    mutate(
+        risk_share = relative_port_risk / sum(relative_port_risk, na.rm = TRUE),
+        raw_chunks = risk_share * total_chunks,
+        chunks_floor = floor(raw_chunks),
+        remainder = raw_chunks - chunks_floor
+    ) |>
+    arrange(desc(remainder), desc(relative_port_risk)) |>
+    mutate(
+        remainder_rank = row_number(),
+        extra_chunks_needed = total_chunks - sum(chunks_floor),
+        extra_chunk = as.integer(remainder_rank <= extra_chunks_needed),
+        chunks_assigned = chunks_floor + extra_chunk
+    ) |>
+    select(port, relative_port_risk, risk_share, chunks_assigned) |>
+    arrange(desc(chunks_assigned), desc(relative_port_risk))
+
+glimpse(relative_port_risk)
+View(relative_port_risk)
+glimpse(relative_port_risk_chunks)
+View(relative_port_risk_chunks)
+```
+
+
+# write relative port risk to output tables
+```{r write-relative-port-risk}
+saveRDS(relative_port_risk, here("data", "processed", "relative_port_risk.rds"))
+write.csv(relative_port_risk, here("outputs", "tables", "relative_port_risk.csv"), row.names = FALSE)
+saveRDS(relative_port_risk_chunks, here("data", "processed", "relative_port_risk_chunks.rds"))
+write.csv(relative_port_risk_chunks, here("outputs", "tables", "relative_port_risk_chunks.csv"), row.names = FALSE)
+
+```
+
+# graph relative port risk
+```{r graph-relative-port-risk}
+library(ggplot2)
+
+ggplot(
+    relative_port_risk |>
+        mutate(port = factor(port, levels = port[order(relative_port_risk, decreasing = TRUE)])),
+    aes(x = port, y = relative_port_risk)
+) +
+    geom_bar(stat = "identity") +
+    theme_minimal() +
+    labs(title = "Relative Port Risk", x = "Port", y = "Relative Risk")
+```
+
+# graph chunk assignment optimization
+```{r graph-chunk-allocation}
+chunk_plot_data <- relative_port_risk_chunks |>
+    tidyr::uncount(chunks_assigned, .id = "chunk_number", .remove = FALSE) |>
+    mutate(port = forcats::fct_reorder(port, chunks_assigned, .desc = TRUE))
+
+ggplot(chunk_plot_data, aes(x = chunk_number, y = port, fill = risk_share)) +
+    geom_tile(color = "white", linewidth = 0.3) +
+    scale_fill_viridis_c(labels = scales::percent_format(accuracy = 1)) +
+    scale_x_continuous(breaks = 1:10) +
+    theme_minimal() +
+    labs(
+        title = "10 Detector Dogs Allocated to Ports",
+        subtitle = "Chunks assigned by largest-remainder rounding of each port's risk share",
+        x = "# of dogs",
+        y = "Port",
+        fill = "Risk Share"
+    )
+
+# save to output figures
+ggsave(here("outputs", "figures", "relative_port_risk_chunks.png"), width = 8, height = 6)
+
+```
