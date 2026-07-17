@@ -1,0 +1,164 @@
+---
+title: "Mexico Origins to Ports"
+output: html_document
+---
+
+## PURPOSE: Estimate the rejection rate of each state in Mexico 
+- based on the proportion of each port's volume and the rejection rate of that port
+- this will be used to estimate the number of at-risk cattle in each state that are moving to the US
+- this assumes that there are not differences in rejection rates in cattle lots going from the same state but to different ports of entry
+    -- This is a VERY strong assumption and likely not true
+
+HOWEVER, we see some clear port profiles in terms of rejection rates, so possibly there is some truth to it
+
+
+NOTE -- just thinking... : This assumption could be tested by considering the distance between rejection profiles of ports and the amount of overlap from same-state sourcing
+
+```{r load-libraries}
+library(dplyr)
+library(here)
+library(ggplot2)
+```
+
+
+```{r load state to port volume per bovine} 
+state_to_port_volume_per_bovine <- read.csv(
+    here("outputs", "tables", "state_to_port_volume_per_bovine.csv"),
+)
+```
+
+# Combine the at-risk rate per port
+
+```{r combine-at-risk-rate-per-port}
+# explore using rejection rate by year instead
+rejection_rates_yr <- readRDS(here("data", "processed", "rejection_rates.rds"))
+rejection_rates_yr <- rejection_rates_yr |> 
+    mutate(year = as.numeric(as.character(year)))
+state_to_port_tmp <- state_to_port_volume_per_bovine |> 
+dplyr::left_join(rejection_rates_yr, by = c("port", "year"))
+
+glimpse(state_to_port_tmp)
+```
+
+# use proportional allocation to determine the rate of at-risk bovine in each area
+# Calculate the proportion of each port's volume by state
+ - Turn it into a matrix and calcualte the proportion of the sum
+
+ ```{r proportion of port volume by state}
+state_prop <- state_to_port_tmp |>
+    dplyr::select(year, state, port, total_port_volume)
+
+state_prop <- state_to_port_tmp |>
+    dplyr::select(year, state, port, total_port_volume) |>
+    group_by(year, port) |>
+    mutate(proportion_port_volume = total_port_volume / sum(total_port_volume, na.rm = TRUE)) |>
+    ungroup()
+
+#sanity check:
+sanity_check <- state_prop |> group_by(port,year) |> summarise(total_proportion_port_volume = sum(proportion_port_volume))
+if (any(is.na(sanity_check$total_proportion_port_volume))) {
+    warning("There are NA values in the total_proportion_port_volume column.")
+} else if (any(sanity_check$total_proportion_port_volume != 0 & sanity_check$total_proportion_port_volume != 1)) {
+    warning("There are values outside 0 and 1 in the total_proportion_port_volume column.")
+} else {
+    cat("All values in total_proportion_port_volume are either 1 or 0 [0, 1], as intended.\n See object sanity_check in code")
+}
+
+state_to_port_tmp2 <- state_to_port_tmp |>
+    left_join(state_prop, by = c("year", "port", "state"))
+glimpse(state_to_port_tmp2)
+#View(state_to_port_tmp2)
+ ```
+
+# calculate the estimated state-wide at-risk bovine
+```{r rejection-rate-by-state}
+state_rate <- state_to_port_tmp |>
+  group_by(state, year) |>
+  summarise(
+    total_state_shipped = sum(total_port_volume, na.rm = TRUE),
+    estimated_at_risk_cattle = sum(total_port_volume * rejection_rate, na.rm = TRUE),
+    estimated_state_rate_shipped = if_else(
+      total_state_shipped > 0,
+      estimated_at_risk_cattle / total_state_shipped,
+      0,
+      missing = 0
+    ),
+    estimated_state_rate_weighted = if_else(
+      total_state_shipped > 0,
+      sum((total_port_volume / total_state_shipped) * rejection_rate, na.rm = TRUE),
+      0,
+      missing = 0
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(
+    across(
+      c(estimated_state_rate_shipped, estimated_state_rate_weighted),
+      ~ tidyr::replace_na(.x, 0)
+    )
+  )
+
+
+# #estimate the rejection rate of each stateXyear based on the proportion of each port's volume and the rejection rate of that port 
+# state_rate <- state_to_port_tmp2 |>
+#     mutate(estimated_state_rate = proportion_port_volume * rejection_rate) |>
+#     group_by(state, year) |>
+#     mutate(total_state_shipped = sum(total_port_volume, na.rm = TRUE)) |>
+#     summarise(estimated_state_rate = sum(estimated_state_rate, na.rm = TRUE))
+
+glimpse(state_rate)
+#View(state_rate)
+
+# make graph to visualize the yearly estimates
+library(ggplot2)
+state_rate_plot <- ggplot(state_rate, aes(x = year, y = estimated_state_rate_weighted, color = state)) +
+    geom_line() +
+    geom_point() +
+    theme_minimal() +
+    labs(
+        title = "Estimated State Rejection Rates Over Time",
+        x = "Year",
+        y = "Estimated State Rejection Rate"
+    )
+
+state_rate_plot
+
+state_rate_plot2 <- ggplot(state_rate, aes(x = year, y = estimated_state_rate_shipped, color = state)) +
+    geom_line() +
+    geom_point() +
+    theme_minimal() +
+    labs(
+        title = "Estimated State Rejection Rates Over Time",
+        x = "Year",
+        y = "Estimated State Rejection Rate"
+    )
+
+state_rate_plot2
+```
+
+# Save
+```{r save-data-and-graphs}
+# save state_rate estimates
+saveRDS(
+    state_rate,
+    here("data", "processed", "state_rate.rds")
+)
+write.csv(
+    state_rate,
+    here("data", "processed", "state_rate.csv"),
+    row.names = FALSE
+)
+write.csv(
+    state_rate,
+    here("outputs", "tables", "state_rate.csv"),
+    row.names = FALSE
+)
+
+# save state_rate graph
+ggsave(
+    here("outputs", "figures", "state_rate_plot.png"),
+    plot = state_rate_plot,
+    width = 8,
+    height = 6
+)
+```

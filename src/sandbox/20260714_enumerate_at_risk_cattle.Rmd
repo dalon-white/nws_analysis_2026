@@ -1,0 +1,220 @@
+---
+title: "Mexico Origins to Ports"
+output: html_document
+---
+
+## PURPOSE: Bring together rejection rates at ports, cattle origin, and NWS prevalence to estimate the number of at-risk cattle moving from Mexico to the US by port of entry and year.
+
+## We will produce 3 estimates with mean, 05, and 95% each:
+    - nws_prevalence_from_state
+        1. This is the number of cattle moving from the state to the port, and the prevalence of NWS in that state
+    - at_risk_cattle_port_estimate
+        1. This is the nws_prevalence_from_state multiplied by the rejection_rate at that port
+        2. This is the combination of the prevalence of NWS, volume shipped, and how often cattleat the ports are susceptible to NWS
+    - at_risk_cattle_state_estimate
+        1. This is the nws_prevalence_from_state multiplied by the STATE rejection rate
+        2. This is the combination of the prevalence of NWS, volume shipped, how often cattle that are shipped from that state are susceptible to NWS
+        3. This is then applicable to future estimates where the ports that are open will shift
+
+```{r load libraries}
+library(here)
+library(tidyverse)
+source("src/normalize_state_names.R")
+```
+
+# gather data
+```{r gather-cattle-volume}
+
+## Load the state to port volume data
+state_to_port_volume_per_bovine <- readRDS(
+    here("data", "processed", "state_to_port_volume_per_bovine.rds")
+)
+glimpse(state_to_port_volume_per_bovine)
+
+## Load the estimated rejection rate by state
+state_rate <- readRDS(
+    here("data", "processed", "state_rate.rds")
+)
+glimpse(state_rate)
+
+# Load prevalence of NWS by state from Marian Talbert's analysis
+prevalence <- readxl::read_excel(here("data", "raw", "mexico state prevalence.xlsx"))
+glimpse(prevalence)
+
+## Load the rejection rates by port and year
+rejection_rates <- readRDS(here("data", "processed", "rejection_rates.rds"))
+glimpse(rejection_rates)
+```
+
+# Combine the at-risk rate per port
+
+NOTE: 7/14/26 As I'm developing this I'm thinking we don't need the rejection rate by port any more, we will use the reject rate by state instead
+```{r combine-at-risk-rate-per-port}
+# state_to_port_tmp <- state_to_port_volume_per_bovine |> 
+# dplyr::left_join(rejection_rates, by = "port")
+
+# # explore using rejection rate by year instead
+# rejection_rates_yr <- readRDS(here("data", "processed", "rejection_rates.rds"))
+rejection_rates <- rejection_rates |> 
+    mutate(year = as.numeric(as.character(year)))
+state_to_port_tmp <- state_to_port_volume_per_bovine |> 
+dplyr::left_join(rejection_rates, by = c("port", "year"))
+
+glimpse(state_to_port_tmp)
+```
+
+### NOTE -- REPLACE DETECTIONS WITH PREVALENCE FROM VS (7/10/2026)
+Marian Talbert's approach estimates prevalence with BOTH detections and bovine population.
+We can skip both detections and bovine populations that were previous coded in and add the more advanced prediction of prevalence from VS. This will be more accurate than just detections.
+** IMPORTANT **
+The prevalence value is for CURRENT prevalence in the last couple of weeks; the prevalence is changing rapidly and has decreased from 2025 to 2026; the current prevalence is being applied to all years in the dataset, as it relates to volume of cattle moving from one state to a given port of entry
+
+```{r add prevalence}
+source("src/normalize_state_names.R")
+prevalence <- prevalence |>
+    mutate(state_join = canonicalize_mexico_state(State))
+
+state_to_port_tmp <- state_to_port_tmp |>
+    mutate(state_join = canonicalize_mexico_state(state))
+
+#join with dataset
+
+state_to_port_tmp <- state_to_port_tmp |>
+    left_join(prevalence, by = "state_join")
+
+unmatched_states <- state_to_port_tmp |>
+    filter(is.na(AP_Estimated)) |>
+    distinct(state, state_join) |>
+    arrange(state)
+
+if (nrow(unmatched_states) > 0) {
+    message("Unmatched states after prevalence join:")
+    print(unmatched_states)
+}
+    
+glimpse(state_to_port_tmp)
+#View(state_to_port_tmp)
+```
+
+# Calculate relative prevalence of NWS and volume to each port
+AP_Estimated is a measure of the detections of NWS in the state, the number of bovine in the state, and the number of detections in surrounding states
+ - From Marian Talbert's markdown: "Apparent prevalence (AP) was calculated as the number of detections divided by the estimated state‑level cattle population."
+
+Therefore:
+    AP_estimated = detects/bovine pop;
+    AP_estimated * total_port_vol = detects/bovine pop * total_port_vol = detects * total_port_vol/bovine pop;
+    - My prevous method used detections / bovine_pop * total_port_vol, so these are equivalent
+
+** Will add an adjustment after this step for the estiamted risk profile of each state (i.e., appropriating the risk rate by the cattle origins for each port to guess where the risky cattle originated from, since that data is not available)
+    
+
+```{r calculate-at-risk-cattle}
+state_to_port <- state_to_port_tmp |>
+    mutate(nws_prevalence_from_state = AP_Estimated * total_port_volume,
+           nws_prevalence_from_state_lwr = lwr05 * total_port_volume,
+           nws_prevalence_from_state_upr = upr95 * total_port_volume)
+glimpse(state_to_port)
+#View(state_to_port)
+```
+
+# Risk rate adjusted by port of entry rejection rates
+Adjust prevalence to rejection rate at PoE;
+This will down-weight relative abundance of NWS with the estimated number of potentially affected cattle that arrive at the port of entry
+
+```{r weight-by-state-risk-rate}
+state_to_port <- state_to_port |>
+    mutate(
+           at_risk_cattle_port_estimate = nws_prevalence_from_state * rejection_rate,
+           at_risk_cattle_port_estimate_lwr = nws_prevalence_from_state_lwr * rejection_rate,
+           at_risk_cattle_port_estimate_upr = nws_prevalence_from_state_upr * rejection_rate
+    )
+```
+
+# Risk rate adjusted by state of origin
+Adjust prevalence to rejection rate by state;
+This will down-weight relative abundance of NWS with the estimated number of potentially affected cattle coming from that state
+
+```{r weight-by-state-risk-rate}
+state_to_port <- state_to_port |>
+    dplyr::left_join(state_rate) |>
+    dplyr::mutate(
+           at_risk_cattle_state_estimate = nws_prevalence_from_state * estimated_state_rate_weighted,
+           at_risk_cattle_state_estimate_lwr = nws_prevalence_from_state_lwr * estimated_state_rate_weighted,
+           at_risk_cattle_state_estimate_upr = nws_prevalence_from_state_upr * estimated_state_rate_weighted
+    )
+glimpse(state_to_port)
+#View(state_to_port |> dplyr::select(year,state,port,rejection_rate,estimated_state_rate_weighted, nws_prevalence_from_state, at_risk_cattle_port_estimate, at_risk_cattle_state_estimate))
+
+
+```
+
+```{r visualize-at-risk-cattle}
+# check the difference between at_risk_cattle_port_estimate and at_risk_cattle_state_estimate
+port_vs_state_plot <- ggplot(state_to_port, aes(x = at_risk_cattle_port_estimate, y = at_risk_cattle_state_estimate, color = port)) +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(title = "Comparison of At-Risk Cattle Estimates by Port vs State Rejection Rates",
+         x = "At-Risk Cattle Estimate (Port Rejection Rate)",
+         y = "At-Risk Cattle Estimate (State Rejection Rate)") +
+    theme_minimal()
+port_vs_state_plot
+
+
+port_vs_state_plot2 <- ggplot(state_to_port,
+        aes(x = at_risk_cattle_port_estimate,
+        y = at_risk_cattle_state_estimate,
+        color = state)) +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(title = "Comparison of At-Risk Cattle Estimates by Port vs State Rejection Rates",
+         x = "At-Risk Cattle Estimate (Port Rejection Rate)",
+         y = "At-Risk Cattle Estimate (State Rejection Rate)") +
+    theme_minimal()
+port_vs_state_plot2
+
+```
+
+# Save data and plots
+```{r save-data-and-graphs}
+
+# Write to final output tables
+saveRDS(
+    state_to_port,
+    here("outputs", "tables", "state_to_port_final.rds")
+)
+
+write.csv(
+    state_to_port,
+    here("outputs", "tables", "state_to_port_final.csv"),
+    row.names = FALSE
+)
+
+# Write to processed data folder
+
+saveRDS(
+    state_to_port,
+    here("data", "processed", "state_to_port_final.rds")
+)
+write.csv(
+    state_to_port,
+    here("data", "processed", "state_to_port_final.csv"),
+    row.names = FALSE
+)
+
+
+
+# Save plots
+ggsave(
+    here::here("outputs", "figures", "port_vs_state_at_risk_cattle_estimates_by_port.png"),
+    plot = port_vs_state_plot,
+    width = 8,
+    height = 6
+)
+
+ggsave(
+    here::here("outputs", "figures", "port_vs_state_at_risk_cattle_estimates_by_state.png"),
+    plot = port_vs_state_plot2,
+    width = 8,
+    height = 6
+)
+```

@@ -3,109 +3,204 @@ title: "Relative Port Risk Summation"
 output: html_document
 ---
 
-# Purpose: To summarize the port and state data into a singular measure of relative risk per port
-# Alternative: View in a multivariate approach like principal component analysis (PCA) or clustering to assess relative risk patterns across ports and states
+## Purpose: To summarize the port and state data into a singular measure of relative risk per port
 
-# Summarize a single measure:
-```{r combine-values}
+# gather n dogs
+```{r load-parameters}
 library(here)
-library(tidyverse)
+library(dplyr)
+
+source("src/utils/parameters.R")
+n_dogs
+opened_ports
 
 state_to_port_final <- readRDS(here("data", "processed", "state_to_port_final.rds"))
+glimpse(state_to_port_final)
+```
+```{r identify-risk-columns-for-downstream-functions}
+# Identify the various risk columns I want to use for the assignment of risk chunks
+#risk_columns <- c("nws_prevalence_from_state","at_risk_cattle_port_estimate","at_risk_cattle_state_estimate")
 
+#identify by searching for name
+risk_columns <- names(state_to_port_final |> dplyr::select(
+    any_of(
+        c(starts_with("nws"),
+        starts_with("at_risk_cattle")
+        ))))
+```
+
+# summarize columns by year and port
+```{r summarize-relative-port-risk}
 relative_port_risk <- state_to_port_final |>
-    mutate(
-        relative_port_risk = 
-        #percent of state exported; how many are going to each port
-        (total_port_volume / total_state_bovine)
-        *
-        #total estimated at-risk cows; as a relative measure of the infestation level
-        (detections_at_or_to / total_state_bovine)
-        *
-        #state at-risk cows
-        (estimated_state_rate * total_state_bovine)
-    ) |>
     group_by(port, year) |>
-    summarise(
-        relative_port_risk = sum(relative_port_risk, na.rm = TRUE),
-        .groups = "drop"
-    ) |>
-    group_by(port) |>
-    summarise(
-        relative_port_risk = mean(relative_port_risk, na.rm = TRUE),
-        .groups = "drop"
-    ) |>
-    arrange(desc(relative_port_risk))
-
-total_chunks <- 10
-
-relative_port_risk_chunks <- relative_port_risk |>
-    mutate(
-        risk_share = relative_port_risk / sum(relative_port_risk, na.rm = TRUE),
-        raw_chunks = risk_share * total_chunks,
-        chunks_floor = floor(raw_chunks),
-        remainder = raw_chunks - chunks_floor
-    ) |>
-    arrange(desc(remainder), desc(relative_port_risk)) |>
-    mutate(
-        remainder_rank = row_number(),
-        extra_chunks_needed = total_chunks - sum(chunks_floor),
-        extra_chunk = as.integer(remainder_rank <= extra_chunks_needed),
-        chunks_assigned = chunks_floor + extra_chunk
-    ) |>
-    select(port, relative_port_risk, risk_share, chunks_assigned) |>
-    arrange(desc(chunks_assigned), desc(relative_port_risk))
-
-glimpse(relative_port_risk)
-View(relative_port_risk)
-glimpse(relative_port_risk_chunks)
-View(relative_port_risk_chunks)
-```
-
-
-# write relative port risk to output tables
-```{r write-relative-port-risk}
-saveRDS(relative_port_risk, here("data", "processed", "relative_port_risk.rds"))
-write.csv(relative_port_risk, here("outputs", "tables", "relative_port_risk.csv"), row.names = FALSE)
-saveRDS(relative_port_risk_chunks, here("data", "processed", "relative_port_risk_chunks.rds"))
-write.csv(relative_port_risk_chunks, here("outputs", "tables", "relative_port_risk_chunks.csv"), row.names = FALSE)
+    summarise(across(all_of(risk_columns), ~sum(.x, na.rm = TRUE)), .groups = "drop") |>
+    arrange(desc(at_risk_cattle_port_estimate)) |> 
+     ungroup()
 
 ```
 
-# graph relative port risk
-```{r graph-relative-port-risk}
-library(ggplot2)
 
-ggplot(
-    relative_port_risk |>
-        mutate(port = factor(port, levels = port[order(relative_port_risk, decreasing = TRUE)])),
-    aes(x = port, y = relative_port_risk)
-) +
-    geom_bar(stat = "identity") +
-    theme_minimal() +
-    labs(title = "Relative Port Risk", x = "Port", y = "Relative Risk")
+# assign n_dogs as risk chunks
+```{r }
+#retrieve the risk chunk assignment function
+source("src/assign_dogs.R")
+
+risk_chunk_results <- assign_risk_chunks(
+    data = relative_port_risk,
+    risk_columns = risk_columns,
+    total_chunks = n_dogs,
+    by_year = TRUE
+)
+
+#save data
+saveRDS(risk_chunk_results, here("data", "processed", "risk_chunk_results.rds"))
+write.csv(risk_chunk_results, here("data", "processed", "risk_chunk_results.csv"), row.names = FALSE)
+write.csv(risk_chunk_results, here("outputs", "tables", "risk_chunk_results.csv"), row.names = FALSE)
 ```
 
-# graph chunk assignment optimization
-```{r graph-chunk-allocation}
-chunk_plot_data <- relative_port_risk_chunks |>
-    tidyr::uncount(chunks_assigned, .id = "chunk_number", .remove = FALSE) |>
-    mutate(port = forcats::fct_reorder(port, chunks_assigned, .desc = TRUE))
 
-ggplot(chunk_plot_data, aes(x = chunk_number, y = port, fill = risk_share)) +
-    geom_tile(color = "white", linewidth = 0.3) +
-    scale_fill_viridis_c(labels = scales::percent_format(accuracy = 1)) +
-    scale_x_continuous(breaks = 1:10) +
-    theme_minimal() +
-    labs(
-        title = "10 Detector Dogs Allocated to Ports",
-        subtitle = "Chunks assigned by largest-remainder rounding of each port's risk share",
-        x = "# of dogs",
-        y = "Port",
-        fill = "Risk Share"
+```{r evaluate-outcomes}
+# Build and save an HTML summary of chunk assignment counts.
+html_escape <- function(x) {
+    x <- as.character(x)
+    x <- gsub("&", "&amp;", x, fixed = TRUE)
+    x <- gsub("<", "&lt;", x, fixed = TRUE)
+    x <- gsub(">", "&gt;", x, fixed = TRUE)
+    x
+}
+
+build_table_html <- function(df, digits = 3) {
+    if (nrow(df) == 0) {
+        return("<p>No rows to display.</p>")
+    }
+
+    display_df <- df
+    for (col in names(display_df)) {
+        if (is.numeric(display_df[[col]])) {
+            display_df[[col]] <- format(round(display_df[[col]], digits = digits), nsmall = 0, trim = TRUE)
+        }
+    }
+
+    header <- paste0("<tr>", paste0("<th>", html_escape(names(display_df)), "</th>", collapse = ""), "</tr>")
+    rows <- apply(display_df, 1, function(row_vals) {
+        paste0("<tr>", paste0("<td>", html_escape(row_vals), "</td>", collapse = ""), "</tr>")
+    })
+
+    paste0("<table>", header, paste0(rows, collapse = ""), "</table>")
+}
+
+safe_file_name <- function(x) {
+    gsub("[^A-Za-z0-9_]+", "_", x)
+}
+
+# Pick one risk column output for downstream plotting/saving when needed.
+relative_port_risk_chunks <- risk_chunk_results[["at_risk_cattle_port_estimate"]]
+
+summary_sections <- lapply(names(risk_chunk_results), function(risk_name) {
+    risk_df <- risk_chunk_results[[risk_name]]
+
+    plot_file <- paste0("relative_port_risk_chunk_counts_", safe_file_name(risk_name), ".png")
+    plot_path <- here("outputs", "report", plot_file)
+
+    if ("year" %in% names(risk_df) && dplyr::n_distinct(risk_df$year) > 1) {
+        plot_obj <- ggplot2::ggplot(
+            risk_df,
+            ggplot2::aes(x = chunks_assigned, y = stats::reorder(port, chunks_assigned))
+        ) +
+            ggplot2::geom_col(fill = "#1f78b4") +
+            ggplot2::facet_wrap(~year, ncol = 1, scales = "free_y") +
+            ggplot2::scale_x_continuous(limits = c(0, n_dogs)) +
+            ggplot2::labs(
+                title = paste("Chunks Assigned by Port -", risk_name),
+                x = "n dogs (chunks assigned)",
+                y = "port"
+            ) +
+            ggplot2::theme_minimal(base_size = 11)
+
+        plot_height <- max(7, 3.2 * dplyr::n_distinct(risk_df$year))
+    } else {
+        plot_obj <- ggplot2::ggplot(
+            risk_df,
+            ggplot2::aes(x = chunks_assigned, y = stats::reorder(port, chunks_assigned))
+        ) +
+            ggplot2::geom_col(fill = "#1f78b4") +
+            ggplot2::scale_x_continuous(limits = c(0, n_dogs)) +
+            ggplot2::labs(
+                title = paste("Chunks Assigned by Port -", risk_name),
+                x = "n dogs (chunks assigned)",
+                y = "port"
+            ) +
+            ggplot2::theme_minimal(base_size = 11)
+
+        plot_height <- 7
+    }
+
+    ggplot2::ggsave(
+        filename = plot_path,
+        plot = plot_obj,
+        width = 11,
+        height = plot_height,
+        dpi = 160
     )
 
-# save to output figures
-ggsave(here("outputs", "figures", "relative_port_risk_chunks.png"), width = 8, height = 6)
+    by_year <- risk_df |>
+        dplyr::group_by(year) |>
+        dplyr::summarise(
+            total_chunks_assigned = sum(chunks_assigned, na.rm = TRUE),
+            ports_with_chunks = sum(chunks_assigned > 0, na.rm = TRUE),
+            total_ports = dplyr::n_distinct(port),
+            .groups = "drop"
+        ) |>
+        dplyr::arrange(year)
 
+    totals <- risk_df |>
+        dplyr::summarise(
+            total_rows = dplyr::n(),
+            total_years = dplyr::n_distinct(year),
+            total_ports = dplyr::n_distinct(port),
+            rows_with_chunks = sum(chunks_assigned > 0, na.rm = TRUE),
+            total_chunks_assigned = sum(chunks_assigned, na.rm = TRUE)
+        )
+
+    paste0(
+        "<section>",
+        "<h2>", html_escape(risk_name), "</h2>",
+        "<h3>Chunks by port</h3>",
+        "<img src='", html_escape(plot_file), "' alt='Chunks assigned by port plot' style='max-width:100%;height:auto;border:1px solid #d1d5db;' />",
+        "<h3>Overall counts</h3>",
+        build_table_html(totals),
+        "<h3>Counts by year</h3>",
+        build_table_html(by_year),
+        "</section>"
+    )
+})
+
+report_path <- here("outputs", "report", "relative_port_risk_chunk_counts.html")
+
+report_html <- paste0(
+    "<!doctype html>",
+    "<html><head><meta charset='utf-8'><title>Relative Port Risk Chunk Counts</title>",
+    "<style>",
+    "body{font-family:Segoe UI,Tahoma,Arial,sans-serif;margin:24px;line-height:1.4;color:#1f2937;}",
+    "h1{margin-bottom:8px;} h2{margin-top:28px;} h3{margin:10px 0 6px;}",
+    "p.meta{color:#4b5563;margin-top:0;}",
+    "table{border-collapse:collapse;margin:8px 0 18px;min-width:560px;}",
+    "th,td{border:1px solid #d1d5db;padding:6px 10px;text-align:left;}",
+    "th{background:#f3f4f6;font-weight:600;}",
+    "section{padding-top:4px;border-top:1px solid #e5e7eb;}",
+    "</style></head><body>",
+    "<h1>Relative Port Risk Chunk Counts</h1>",
+    "<p class='meta'>Generated on ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "</p>",
+    "<p class='meta'>Configured chunks (n_dogs): ", html_escape(n_dogs), "</p>",
+    paste0(summary_sections, collapse = ""),
+    "</body></html>"
+)
+
+writeLines(report_html, report_path, useBytes = TRUE)
+message("Wrote report: ", report_path)
+
+names(risk_chunk_results)
+glimpse(relative_port_risk_chunks)
 ```
+
+

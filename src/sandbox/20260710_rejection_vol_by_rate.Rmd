@@ -1,0 +1,138 @@
+# Create a scatterplot of rejection volume and rejection rate by port of entry
+    Find the median of each and plot them as horizontal and vertical lines to create quandrants on the graph.
+
+```{r access rejection data and calculate median}
+rejection_rates_rds_path <- here("data", "processed", "rejection_rates.rds")
+
+rejections_volume <- readRDS(rejection_rates_rds_path)
+
+# convert rejection rate to percent
+rejections_volume <- rejections_volume |> mutate(rejection_rate = rejection_rate * 100)
+
+# summarize by port of entry but maintaining variance across year within each port
+rejections_volume_summ <- rejections_volume |> group_by(port) |> summarise(
+  rejections_sem = sd(rejections, na.rm = TRUE) / sqrt(sum(!is.na(rejections))),
+  rejection_rate_sem = sd(rejection_rate, na.rm = TRUE) / sqrt(sum(!is.na(rejection_rate))),
+    rejections = mean(rejections, na.rm = TRUE),
+    rejection_rate = mean(rejection_rate, na.rm = TRUE),
+    .groups = "drop"
+)
+
+# gatehr median values for quadrant drawing on plots
+median_rejection_volume <- median(rejections_volume$rejections, na.rm = TRUE)
+median_rejection_rate <- median(rejections_volume$rejection_rate, na.rm = TRUE)
+```
+
+# Attach formal port names and longitudes to the data
+
+```{r attach port names and longitudes}
+# Load port names and longitudes
+port_names_longitudes <- readxl::read_excel(here("data", "raw", "port of entry reference table.xlsx"))
+
+rejections_volume_summ <- rejections_volume_summ |> left_join(port_names_longitudes, by = "port")
+```
+
+
+```{r plot rejection volume and rate}
+x_vals <- rejections_volume_summ$rejections
+y_vals <- rejections_volume_summ$rejection_rate
+
+x_max <- max(x_vals, na.rm = TRUE)
+y_min <- min(y_vals, na.rm = TRUE)
+y_max <- max(y_vals, na.rm = TRUE)
+
+# Start x-axis above zero to avoid compressing the points.
+x_lower <- 250
+x_breaks <- sort(unique(c(500, 1000, pretty(c(500, x_max), n = 5))))
+x_breaks <- x_breaks[x_breaks >= 500]
+
+# Quadrant label anchor points (offset from median lines).
+x_left_label <- (x_lower + median_rejection_volume) / 2
+x_right_label <- (median_rejection_volume + x_max) / 2
+y_low_label <- (y_min + median_rejection_rate) / 2
+y_high_label <- (median_rejection_rate + y_max) / 2
+
+quadrant_labels <- tibble::tibble(
+  x = c(x_left_label, x_right_label, x_left_label, x_right_label),
+  y = c(y_high_label, y_high_label, y_low_label, y_low_label),
+  label = c(
+    "Low rejection volume,\nhigh rejection rate",
+    "High rejection volume,\nhigh rejection rate",
+    "Low rejection volume,\nlow rejection rate",
+    "High rejection volume,\nlow rejection rate"
+  )
+)
+
+rej_volume_rate_plot <- ggplot(rejections_volume_summ, aes(x = rejections, y = rejection_rate, color = lon)) +
+#   geom_rect(
+#     inherit.aes = FALSE,
+#     aes(xmin = x_lower, xmax = 0, ymin = -Inf, ymax = Inf),
+#     fill = "gray90",
+#     color = NA,
+#     alpha = 0.6
+#   ) +
+  geom_segment(
+    aes(
+      x = rejections,
+      xend = rejections,
+      y = rejection_rate - rejection_rate_sem,
+      yend = rejection_rate + rejection_rate_sem
+    ),
+    linewidth = 0.5,
+    alpha = 0.8,
+    show.legend = FALSE
+  ) +
+  geom_segment(
+    aes(
+      x = rejections - rejections_sem,
+      xend = rejections + rejections_sem,
+      y = rejection_rate,
+      yend = rejection_rate
+    ),
+    linewidth = 0.5,
+    alpha = 0.8,
+    show.legend = FALSE
+  ) +
+  geom_point() +
+  ggrepel::geom_text_repel(
+    aes(label = name),
+    size = 3,
+    box.padding = 0.25,
+    point.padding = 0.2,
+    min.segment.length = 0,
+    segment.color = "gray60",
+    show.legend = FALSE
+  ) +
+  geom_vline(xintercept = median_rejection_volume, linetype = "dashed", color = "gray") +
+  geom_hline(yintercept = median_rejection_rate, linetype = "dashed", color = "gray") +
+  geom_text(
+    data = quadrant_labels,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    color = "gray35",
+    size = 3.5,
+    fontface = "bold",
+    lineheight = 0.95
+  ) +
+  scale_x_continuous(
+    trans = scales::pseudo_log_trans(base = 10),
+    breaks = x_breaks,
+    labels = scales::label_number(big.mark = ","),
+    limits = c(x_lower, NA)
+  ) +
+  scale_color_viridis_c(option = "inferno", begin = 0.25, end = 0.75) +
+  labs(title = "Rejection volume vs rejection rate by port of entry and year",
+       x = "Mean yearly rejection volume (# of cattle)",
+      y = "Mean yearly rejection rate (%)",
+      color = "Longitude") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+rej_volume_rate_plot
+```
+
+
+```{r save rejection volume and rate plot}
+rej_volume_rate_fig <- here("outputs", "figures", "rejection_volume_vs_rate_by_port.png")
+ggsave(rej_volume_rate_fig, plot = rej_volume_rate_plot, width = 8, height = 6)
+
+```

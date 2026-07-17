@@ -1,0 +1,968 @@
+---
+title: "Mexico Origins to Ports"
+output: html_document
+---
+
+## PURPOSE: Estimate the risk when not all ports are open
+
+# Method:
+
+This notebook redistributes risk that was historically assigned to currently closed ports.
+
+Primary model:
+- Historical-share plus distance-decay choice model.
+
+Sensitivity model:
+- Gravity-style model.
+
+Validation and stress tests:
+- Fit on 2023 and predict 2024.
+- Fit on 2024 and predict 2023.
+- Leave-one-port-out substitution tests.
+
+Primary rerouting outcome:
+- at_risk_cattle_state_estimate
+
+Sensitivity outcomes shown in rerouting outputs:
+- nws_prevalence_from_state
+- at_risk_cattle_port_estimate
+
+```{r setup}
+library(here)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(sf)
+
+source("src/utils/parameters.R")
+source("src/normalize_state_names.R")
+source("src/assign_dogs.R")
+
+set.seed(20260715)
+```
+
+```{r load-data}
+state_to_port <- readRDS(here("data", "processed", "state_to_port_final.rds")) |>
+	mutate(
+		year = as.integer(year),
+		port = str_to_lower(port),
+		state_join = canonicalize_mexico_state(state)
+	)
+
+volume_df <- state_to_port |>
+	dplyr::select(year, state_join, port, total_port_volume) |>
+	mutate(total_port_volume = as.numeric(total_port_volume))
+
+risk_outcomes <- c(
+	"at_risk_cattle_state_estimate",
+	"nws_prevalence_from_state",
+	"at_risk_cattle_port_estimate"
+)
+
+years_available <- sort(unique(volume_df$year))
+ports_available <- sort(unique(volume_df$port))
+
+if (!all(opened_ports %in% ports_available)) {
+	stop("One or more opened_ports are not present in state_to_port_final.")
+}
+
+if (!all(c(2023, 2024) %in% years_available)) {
+	stop("This notebook expects 2023 and 2024 in state_to_port_final.")
+}
+```
+
+```{r load-state-port-distance-table}
+distance_candidates <- c(
+	here("data", "processed", "state_port_drive_time.csv"),
+	here("data", "processed", "state_port_distance_placeholder.csv")
+)
+
+distance_file <- distance_candidates[file.exists(distance_candidates)][1]
+
+if (is.na(distance_file)) {
+	stop(
+		"No state-to-port distance table found. Run src/state_to_port_drive_time.R first."
+	)
+}
+
+distance_placeholder <- read_csv(distance_file, show_col_types = FALSE) |>
+	mutate(
+		state_join = canonicalize_mexico_state(state_join),
+		port = str_to_lower(port),
+		distance_guess_km = as.numeric(distance_guess_km)
+	) |>
+	dplyr::select(state_join, port, distance_guess_km) |>
+	distinct()
+
+expected_pairs <- expand_grid(
+	state_join = sort(unique(volume_df$state_join)),
+	port = sort(unique(volume_df$port))
+)
+
+distance_placeholder <- expected_pairs |>
+	left_join(distance_placeholder, by = c("state_join", "port"))
+
+if (any(is.na(distance_placeholder$distance_guess_km))) {
+	stop(
+		"Distance table has missing values for one or more state/port pairs. ",
+		"Regenerate with src/state_to_port_drive_time.R and ensure all routes succeed."
+	)
+}
+```
+
+```{r modeling-helpers}
+add_state_totals <- function(df) {
+	df |>
+		group_by(year, state_join) |>
+		mutate(total_state_volume = sum(total_port_volume, na.rm = TRUE)) |>
+		ungroup()
+}
+
+add_history_from_reference <- function(df, ref_df) {
+	hist_tbl <- ref_df |>
+		group_by(state_join, port) |>
+		summarise(hist_volume = sum(total_port_volume, na.rm = TRUE), .groups = "drop")
+
+	df |>
+		left_join(hist_tbl, by = c("state_join", "port")) |>
+		mutate(hist_volume = coalesce(hist_volume, 0))
+}
+
+add_leave_year_out_history <- function(df) {
+	pair_totals <- df |>
+		group_by(state_join, port) |>
+		summarise(total_pair_volume = sum(total_port_volume, na.rm = TRUE), .groups = "drop")
+
+	df |>
+		left_join(pair_totals, by = c("state_join", "port")) |>
+		mutate(hist_volume = pmax(total_pair_volume - total_port_volume, 0)) |>
+		dplyr::select(-total_pair_volume)
+}
+
+augment_model_inputs <- function(df, distance_tbl) {
+	df |>
+		left_join(distance_tbl, by = c("state_join", "port")) |>
+		mutate(
+			log_distance_km = log(pmax(distance_guess_km, 1)),
+			log_hist_volume = log1p(hist_volume),
+			total_state_volume = pmax(total_state_volume, 1)
+		)
+}
+
+fit_primary_model <- function(train_df) {
+	glm(
+		total_port_volume ~ port + log_distance_km + log_hist_volume,
+		offset = log(total_state_volume),
+		family = quasipoisson(link = "log"),
+		data = train_df
+	)
+}
+
+fit_gravity_model <- function(train_df) {
+	glm(
+		total_port_volume ~ state_join + port + log_distance_km,
+		offset = log(total_state_volume),
+		family = quasipoisson(link = "log"),
+		data = train_df
+	)
+}
+
+predict_normalized_shares <- function(model_obj, new_df, open_port_subset = NULL) {
+	d <- new_df
+	if (!is.null(open_port_subset)) {
+		d <- d |>
+			filter(port %in% open_port_subset)
+	}
+
+	pred_vals <- as.numeric(predict(model_obj, newdata = d, type = "response"))
+
+	d |>
+		mutate(pred_flow = pmax(pred_vals, 0)) |>
+		group_by(year, state_join) |>
+		mutate(
+			pred_share = {
+				total_pred <- sum(pred_flow, na.rm = TRUE)
+				if (total_pred > 0) {
+					pred_flow / total_pred
+				} else {
+					rep(1 / n(), n())
+				}
+			}
+		) |>
+		ungroup()
+}
+
+evaluate_share_predictions <- function(pred_df, obs_df) {
+	obs_shares <- obs_df |>
+		group_by(year, state_join) |>
+		mutate(obs_share = {
+			total_obs <- sum(total_port_volume, na.rm = TRUE)
+			if (total_obs > 0) {
+				total_port_volume / total_obs
+			} else {
+				rep(0, n())
+			}
+		}) |>
+		ungroup() |>
+		dplyr::select(year, state_join, port, total_port_volume, obs_share)
+
+	eval_df <- pred_df |>
+		dplyr::select(year, state_join, port, pred_share, pred_flow) |>
+		left_join(obs_shares, by = c("year", "state_join", "port")) |>
+		mutate(
+			abs_error_share = abs(pred_share - obs_share),
+			sq_error_share = (pred_share - obs_share)^2,
+			kl_term = if_else(
+				obs_share > 0,
+				obs_share * log(obs_share / pmax(pred_share, 1e-10)),
+				0
+			)
+		)
+
+	overall <- eval_df |>
+		summarise(
+			mae_share = mean(abs_error_share, na.rm = TRUE),
+			rmse_share = sqrt(mean(sq_error_share, na.rm = TRUE)),
+			mean_kl = mean(kl_term, na.rm = TRUE),
+			.groups = "drop"
+		)
+
+	state_level <- eval_df |>
+		group_by(year, state_join) |>
+		summarise(
+			mae_share = mean(abs_error_share, na.rm = TRUE),
+			rmse_share = sqrt(mean(sq_error_share, na.rm = TRUE)),
+			kl = sum(kl_term, na.rm = TRUE),
+			observed_total_volume = sum(total_port_volume, na.rm = TRUE),
+			.groups = "drop"
+		)
+
+	list(overall = overall, state_level = state_level, eval_df = eval_df)
+}
+
+run_cross_year <- function(volume_inputs, distance_tbl, train_year, test_year, method = c("primary", "gravity")) {
+	method <- match.arg(method)
+
+	train_df <- volume_inputs |>
+		filter(year == train_year)
+
+	test_df <- volume_inputs |>
+		filter(year == test_year)
+
+	train_df <- add_state_totals(train_df)
+	test_df <- add_state_totals(test_df)
+
+	train_df <- add_history_from_reference(train_df, train_df)
+	test_df <- add_history_from_reference(test_df, train_df)
+
+	train_df <- augment_model_inputs(train_df, distance_tbl)
+	test_df <- augment_model_inputs(test_df, distance_tbl)
+
+	model_obj <- if (method == "primary") {
+		fit_primary_model(train_df)
+	} else {
+		fit_gravity_model(train_df)
+	}
+
+	predictions <- predict_normalized_shares(model_obj, test_df)
+	eval <- evaluate_share_predictions(predictions, test_df)
+
+	list(
+		model = model_obj,
+		predictions = predictions,
+		overall = eval$overall |>
+			mutate(train_year = train_year, test_year = test_year, method = method),
+		state_level = eval$state_level |>
+			mutate(train_year = train_year, test_year = test_year, method = method)
+	)
+}
+
+run_leave_one_port_out <- function(
+	volume_inputs,
+	distance_tbl,
+	train_year,
+	test_year,
+	closed_port,
+	method = c("primary", "gravity")
+) {
+	method <- match.arg(method)
+
+	train_df <- volume_inputs |>
+		filter(year == train_year)
+
+	test_df <- volume_inputs |>
+		filter(year == test_year)
+
+	train_df <- add_state_totals(train_df)
+	test_df <- add_state_totals(test_df)
+
+	train_df <- add_history_from_reference(train_df, train_df)
+	test_df <- add_history_from_reference(test_df, train_df)
+
+	train_df <- augment_model_inputs(train_df, distance_tbl)
+	test_df <- augment_model_inputs(test_df, distance_tbl)
+
+	model_obj <- if (method == "primary") {
+		fit_primary_model(train_df)
+	} else {
+		fit_gravity_model(train_df)
+	}
+
+	states_with_closed_volume <- test_df |>
+		filter(port == closed_port, total_port_volume > 0) |>
+		distinct(state_join)
+
+	if (nrow(states_with_closed_volume) == 0) {
+		return(tibble(
+			method = method,
+			train_year = train_year,
+			test_year = test_year,
+			closed_port = closed_port,
+			n_states = 0,
+			closed_volume = 0,
+			mae_share = NA_real_,
+			rmse_share = NA_real_,
+			mean_kl = NA_real_
+		))
+	}
+
+	test_remaining <- test_df |>
+		semi_join(states_with_closed_volume, by = "state_join") |>
+		filter(port != closed_port)
+
+	pred_remaining <- predict_normalized_shares(model_obj, test_remaining)
+
+	obs_remaining <- test_remaining |>
+		group_by(year, state_join) |>
+		mutate(obs_share = {
+			total_obs <- sum(total_port_volume, na.rm = TRUE)
+			if (total_obs > 0) {
+				total_port_volume / total_obs
+			} else {
+				rep(0, n())
+			}
+		}) |>
+		ungroup() |>
+		select(year, state_join, port, obs_share)
+
+	eval_remaining <- pred_remaining |>
+		dplyr::select(year, state_join, port, pred_share) |>
+		dplyr::left_join(obs_remaining, by = c("year", "state_join", "port")) |>
+		mutate(
+			abs_error = abs(pred_share - obs_share),
+			sq_error = (pred_share - obs_share)^2,
+			kl_term = if_else(
+				obs_share > 0,
+				obs_share * log(obs_share / pmax(pred_share, 1e-10)),
+				0
+			)
+		)
+
+	closed_volume <- test_df |>
+		semi_join(states_with_closed_volume, by = "state_join") |>
+		filter(port == closed_port) |>
+		summarise(v = sum(total_port_volume, na.rm = TRUE)) |>
+		pull(v)
+
+	tibble(
+		method = method,
+		train_year = train_year,
+		test_year = test_year,
+		closed_port = closed_port,
+		n_states = n_distinct(eval_remaining$state_join),
+		closed_volume = closed_volume,
+		mae_share = mean(eval_remaining$abs_error, na.rm = TRUE),
+		rmse_share = sqrt(mean(eval_remaining$sq_error, na.rm = TRUE)),
+		mean_kl = mean(eval_remaining$kl_term, na.rm = TRUE)
+	)
+}
+
+bootstrap_cross_year <- function(
+	volume_inputs,
+	distance_tbl,
+	train_year,
+	test_year,
+	method = c("primary", "gravity"),
+	n_boot = 100
+) {
+	method <- match.arg(method)
+
+	train_df_full <- volume_inputs |>
+		filter(year == train_year)
+	test_df_full <- volume_inputs |>
+		filter(year == test_year)
+
+	state_ids <- sort(unique(train_df_full$state_join))
+
+	boot_results <- vector("list", n_boot)
+
+	for (b in seq_len(n_boot)) {
+		sampled_states <- sample(state_ids, size = length(state_ids), replace = TRUE)
+		state_weights <- as.data.frame(table(sampled_states), stringsAsFactors = FALSE)
+		names(state_weights) <- c("state_join", "wt")
+
+		train_df <- train_df_full |>
+			left_join(state_weights, by = "state_join") |>
+			mutate(wt = coalesce(as.numeric(wt), 0)) |>
+			filter(wt > 0)
+
+		test_df <- test_df_full |>
+			left_join(state_weights, by = "state_join") |>
+			mutate(wt = coalesce(as.numeric(wt), 0)) |>
+			filter(wt > 0)
+
+		train_df <- add_state_totals(train_df)
+		test_df <- add_state_totals(test_df)
+
+		train_df <- add_history_from_reference(train_df, train_df)
+		test_df <- add_history_from_reference(test_df, train_df)
+
+		train_df <- augment_model_inputs(train_df, distance_tbl)
+		test_df <- augment_model_inputs(test_df, distance_tbl)
+
+		model_obj <- if (method == "primary") {
+			glm(
+				total_port_volume ~ port + log_distance_km + log_hist_volume,
+				offset = log(total_state_volume),
+				family = quasipoisson(link = "log"),
+				data = train_df,
+				weights = wt
+			)
+		} else {
+			glm(
+				total_port_volume ~ state_join + port + log_distance_km,
+				offset = log(total_state_volume),
+				family = quasipoisson(link = "log"),
+				data = train_df,
+				weights = wt
+			)
+		}
+
+		pred_df <- predict_normalized_shares(model_obj, test_df)
+		eval <- evaluate_share_predictions(pred_df, test_df)
+
+		boot_results[[b]] <- eval$overall |>
+			mutate(
+				method = method,
+				train_year = train_year,
+				test_year = test_year,
+				boot_id = b
+			)
+	}
+
+	bind_rows(boot_results)
+}
+```
+
+```{r cross-year-validation}
+cross_year_specs <- tibble::tribble(
+	~train_year, ~test_year,
+	2023L, 2024L,
+	2024L, 2023L
+)
+
+cross_primary <- pmap(
+	cross_year_specs,
+	~run_cross_year(volume_df, distance_placeholder, ..1, ..2, method = "primary")
+)
+
+cross_gravity <- pmap(
+	cross_year_specs,
+	~run_cross_year(volume_df, distance_placeholder, ..1, ..2, method = "gravity")
+)
+
+cross_primary_overall <- bind_rows(lapply(cross_primary, function(x) x$overall))
+cross_gravity_overall <- bind_rows(lapply(cross_gravity, function(x) x$overall))
+
+cross_primary_state <- bind_rows(lapply(cross_primary, function(x) x$state_level))
+cross_gravity_state <- bind_rows(lapply(cross_gravity, function(x) x$state_level))
+
+write_csv(
+	cross_primary_overall,
+	here("outputs", "tables", "limited_port_crossyear_primary_overall.csv")
+)
+
+write_csv(
+	cross_gravity_overall,
+	here("outputs", "tables", "limited_port_crossyear_gravity_overall.csv")
+)
+
+write_csv(
+	cross_primary_state,
+	here("outputs", "tables", "limited_port_crossyear_primary_state.csv")
+)
+
+write_csv(
+	cross_gravity_state,
+	here("outputs", "tables", "limited_port_crossyear_gravity_state.csv")
+)
+
+cross_primary_overall
+cross_gravity_overall
+```
+
+```{r leave-one-port-out-tests}
+leave_specs <- expand_grid(
+	method = c("primary", "gravity"),
+	train_year = c(2023L, 2024L),
+	test_year = c(2024L, 2023L),
+	closed_port = ports_available
+) |>
+	filter(train_year != test_year)
+
+leave_results <- pmap_dfr(
+	leave_specs,
+	function(method, train_year, test_year, closed_port) {
+		run_leave_one_port_out(
+			volume_inputs = volume_df,
+			distance_tbl = distance_placeholder,
+			train_year = train_year,
+			test_year = test_year,
+			closed_port = closed_port,
+			method = method
+		)
+	}
+)
+
+write_csv(
+	leave_results,
+	here("outputs", "tables", "limited_port_leave_one_port_out_tests.csv")
+)
+
+leave_results
+```
+
+```{r bootstrap-uncertainty-validation}
+n_boot <- 100
+
+boot_validation <- bind_rows(
+	bootstrap_cross_year(
+		volume_inputs = volume_df,
+		distance_tbl = distance_placeholder,
+		train_year = 2023,
+		test_year = 2024,
+		method = "primary",
+		n_boot = n_boot
+	),
+	bootstrap_cross_year(
+		volume_inputs = volume_df,
+		distance_tbl = distance_placeholder,
+		train_year = 2024,
+		test_year = 2023,
+		method = "primary",
+		n_boot = n_boot
+	),
+	bootstrap_cross_year(
+		volume_inputs = volume_df,
+		distance_tbl = distance_placeholder,
+		train_year = 2023,
+		test_year = 2024,
+		method = "gravity",
+		n_boot = n_boot
+	),
+	bootstrap_cross_year(
+		volume_inputs = volume_df,
+		distance_tbl = distance_placeholder,
+		train_year = 2024,
+		test_year = 2023,
+		method = "gravity",
+		n_boot = n_boot
+	)
+)
+
+boot_summary <- boot_validation |>
+	group_by(method, train_year, test_year) |>
+	summarise(
+		mae_share_p05 = quantile(mae_share, 0.05, na.rm = TRUE),
+		mae_share_p50 = quantile(mae_share, 0.50, na.rm = TRUE),
+		mae_share_p95 = quantile(mae_share, 0.95, na.rm = TRUE),
+		rmse_share_p05 = quantile(rmse_share, 0.05, na.rm = TRUE),
+		rmse_share_p50 = quantile(rmse_share, 0.50, na.rm = TRUE),
+		rmse_share_p95 = quantile(rmse_share, 0.95, na.rm = TRUE),
+		mean_kl_p05 = quantile(mean_kl, 0.05, na.rm = TRUE),
+		mean_kl_p50 = quantile(mean_kl, 0.50, na.rm = TRUE),
+		mean_kl_p95 = quantile(mean_kl, 0.95, na.rm = TRUE),
+		.groups = "drop"
+	)
+
+write_csv(
+	boot_validation,
+	here("outputs", "tables", "limited_port_crossyear_bootstrap_draws.csv")
+)
+
+write_csv(
+	boot_summary,
+	here("outputs", "tables", "limited_port_crossyear_bootstrap_summary.csv")
+)
+
+boot_summary
+```
+
+```{r rerouting-model-fit-all-years}
+scenario_volume <- volume_df |>
+	add_state_totals() |>
+	add_leave_year_out_history() |>
+	augment_model_inputs(distance_placeholder)
+
+primary_scenario_model <- fit_primary_model(scenario_volume)
+gravity_scenario_model <- fit_gravity_model(scenario_volume)
+
+scenario_probs_primary <- predict_normalized_shares(
+	model_obj = primary_scenario_model,
+	new_df = scenario_volume,
+	open_port_subset = opened_ports
+) |>
+	dplyr::select(year, state_join, port, pred_share)
+
+scenario_probs_gravity <- predict_normalized_shares(
+	model_obj = gravity_scenario_model,
+	new_df = scenario_volume,
+	open_port_subset = opened_ports
+) |>
+	dplyr::select(year, state_join, port, pred_share)
+```
+
+```{r reroute-risk-primary-and-sensitivity}
+risk_long <- state_to_port |>
+	dplyr::select(year, state_join, port, all_of(risk_outcomes)) |>
+	pivot_longer(cols = all_of(risk_outcomes), names_to = "outcome", values_to = "risk_value") |>
+	mutate(risk_value = coalesce(as.numeric(risk_value), 0))
+
+reroute_risk_with_probs <- function(risk_data_long, prob_tbl) {
+	closed_risk <- risk_data_long |>
+		filter(!port %in% opened_ports) |>
+		group_by(year, state_join, outcome) |>
+		summarise(closed_risk = sum(risk_value, na.rm = TRUE), .groups = "drop")
+
+	existing_open <- risk_data_long |>
+		filter(port %in% opened_ports) |>
+		mutate(existing_open_risk = risk_value) |>
+		dplyr::select(year, state_join, port, outcome, existing_open_risk)
+
+	existing_open |>
+		left_join(closed_risk, by = c("year", "state_join", "outcome")) |>
+		left_join(prob_tbl, by = c("year", "state_join", "port")) |>
+		mutate(
+			closed_risk = coalesce(closed_risk, 0),
+			pred_share = coalesce(pred_share, 0),
+			rerouted_additional_risk = closed_risk * pred_share,
+			rerouted_total_risk = existing_open_risk + rerouted_additional_risk
+		)
+}
+
+rerouted_primary <- reroute_risk_with_probs(risk_long, scenario_probs_primary) |>
+	mutate(model = "primary")
+
+rerouted_gravity <- reroute_risk_with_probs(risk_long, scenario_probs_gravity) |>
+	mutate(model = "gravity")
+
+rerouted_all <- bind_rows(rerouted_primary, rerouted_gravity)
+
+rerouted_port_year <- rerouted_primary |>
+	group_by(year, port, outcome) |>
+	summarise(
+		rerouted_total_risk = sum(rerouted_total_risk, na.rm = TRUE),
+		existing_open_risk = sum(existing_open_risk, na.rm = TRUE),
+		rerouted_additional_risk = sum(rerouted_additional_risk, na.rm = TRUE),
+		.groups = "drop"
+	)
+
+write_csv(
+	rerouted_all,
+	here("outputs", "tables", "limited_port_rerouted_state_port_risk.csv")
+)
+
+write_csv(
+	rerouted_port_year,
+	here("outputs", "tables", "limited_port_rerouted_port_year_risk_primary.csv")
+)
+
+rerouted_port_year |>
+	filter(outcome == "at_risk_cattle_state_estimate")
+```
+
+```{r rerouting-uncertainty-primary-model}
+scenario_open_rows <- scenario_volume |>
+	filter(port %in% opened_ports)
+
+beta_names <- colnames(vcov(primary_scenario_model))
+X_all <- model.matrix(delete.response(terms(primary_scenario_model)), scenario_open_rows)
+common_beta <- beta_names[beta_names %in% colnames(X_all)]
+X_open <- X_all[, common_beta, drop = FALSE]
+offset_open <- log(pmax(scenario_open_rows$total_state_volume, 1))
+mu_beta <- coef(primary_scenario_model)[common_beta]
+sigma_beta <- vcov(primary_scenario_model)[common_beta, common_beta, drop = FALSE]
+
+coef_draws <- MASS::mvrnorm(
+	n = 300,
+	mu = mu_beta,
+	Sigma = sigma_beta
+)
+
+closed_risk_by_state <- risk_long |>
+	filter(!port %in% opened_ports) |>
+	group_by(year, state_join, outcome) |>
+	summarise(closed_risk = sum(risk_value, na.rm = TRUE), .groups = "drop")
+
+existing_open_by_state <- risk_long |>
+	filter(port %in% opened_ports) |>
+	dplyr::select(year, state_join, port, outcome, existing_open_risk = risk_value)
+
+draw_results <- vector("list", nrow(coef_draws))
+
+for (i in seq_len(nrow(coef_draws))) {
+	eta <- as.numeric(X_open %*% coef_draws[i, ]) + offset_open
+	flow_draw <- exp(eta)
+
+	prob_draw <- scenario_open_rows |>
+		transmute(year, state_join, port, flow_draw) |>
+		group_by(year, state_join) |>
+		mutate(prob_draw = {
+			total_draw <- sum(flow_draw, na.rm = TRUE)
+			if (total_draw > 0) {
+				flow_draw / total_draw
+			} else {
+				rep(1 / n(), n())
+			}
+		}) |>
+		ungroup() |>
+		dplyr::select(year, state_join, port, prob_draw)
+
+	draw_tbl <- existing_open_by_state |>
+		left_join(closed_risk_by_state, by = c("year", "state_join", "outcome")) |>
+		left_join(prob_draw, by = c("year", "state_join", "port")) |>
+		mutate(
+			closed_risk = coalesce(closed_risk, 0),
+			prob_draw = coalesce(prob_draw, 0),
+			rerouted_total_risk = existing_open_risk + (closed_risk * prob_draw)
+		) |>
+		group_by(year, port, outcome) |>
+		summarise(rerouted_total_risk = sum(rerouted_total_risk, na.rm = TRUE), .groups = "drop") |>
+		mutate(draw_id = i)
+
+	draw_results[[i]] <- draw_tbl
+}
+
+reroute_uncertainty_draws <- bind_rows(draw_results)
+
+reroute_uncertainty_summary <- reroute_uncertainty_draws |>
+	group_by(year, port, outcome) |>
+	summarise(
+		rerouted_total_risk_p05 = quantile(rerouted_total_risk, 0.05, na.rm = TRUE),
+		rerouted_total_risk_p50 = quantile(rerouted_total_risk, 0.50, na.rm = TRUE),
+		rerouted_total_risk_p95 = quantile(rerouted_total_risk, 0.95, na.rm = TRUE),
+		.groups = "drop"
+	)
+
+write_csv(
+	reroute_uncertainty_draws,
+	here("outputs", "tables", "limited_port_rerouting_uncertainty_draws.csv")
+)
+
+write_csv(
+	reroute_uncertainty_summary,
+	here("outputs", "tables", "limited_port_rerouting_uncertainty_summary.csv")
+)
+
+reroute_uncertainty_summary |>
+	filter(outcome == "at_risk_cattle_state_estimate")
+```
+
+```{r assign-dogs-rerouted-primary}
+rerouted_for_chunks <- rerouted_port_year |>
+	dplyr::select(year, port, outcome, rerouted_total_risk) |>
+	tidyr::pivot_wider(names_from = outcome, values_from = rerouted_total_risk)
+
+risk_chunk_results_rerouted <- assign_risk_chunks(
+	data = rerouted_for_chunks,
+	risk_columns = risk_outcomes,
+	total_chunks = n_dogs,
+	by_year = TRUE
+)
+
+dog_assignments_rerouted <- bind_rows(
+	lapply(names(risk_chunk_results_rerouted), function(outcome_name) {
+		risk_chunk_results_rerouted[[outcome_name]] |>
+			mutate(outcome = outcome_name)
+	})
+)
+
+write_csv(
+	dog_assignments_rerouted,
+	here("outputs", "tables", "limited_port_rerouted_dog_assignments.csv")
+)
+
+dog_assignments_rerouted |>
+	filter(outcome == "at_risk_cattle_state_estimate") |>
+	arrange(year, desc(chunks_assigned), desc(risk_value))
+```
+
+```{r assign-dogs-rerouted-uncertainty}
+assign_dogs_for_risk_draws <- function(risk_draws, risk_columns, total_chunks) {
+	draw_wide <- risk_draws |>
+		dplyr::select(draw_id, year, port, outcome, rerouted_total_risk) |>
+		tidyr::pivot_wider(names_from = outcome, values_from = rerouted_total_risk)
+
+	draw_ids <- sort(unique(draw_wide$draw_id))
+
+	purrr::map_dfr(draw_ids, function(current_draw_id) {
+		draw_data <- draw_wide |>
+			filter(draw_id == current_draw_id) |>
+			dplyr::select(-draw_id)
+
+		draw_chunk_results <- assign_risk_chunks(
+			data = draw_data,
+			risk_columns = risk_columns,
+			total_chunks = total_chunks,
+			by_year = TRUE
+		)
+
+		bind_rows(
+			lapply(names(draw_chunk_results), function(outcome_name) {
+				draw_chunk_results[[outcome_name]] |>
+					mutate(
+						draw_id = current_draw_id,
+						outcome = outcome_name
+					)
+			})
+		)
+	})
+}
+
+dog_assignment_uncertainty_draws <- assign_dogs_for_risk_draws(
+	risk_draws = reroute_uncertainty_draws,
+	risk_columns = risk_outcomes,
+	total_chunks = n_dogs
+)
+
+static_dog_assignments <- dog_assignments_rerouted |>
+	dplyr::select(year, port, outcome, static_chunks_assigned = chunks_assigned)
+
+dog_assignment_uncertainty_summary <- dog_assignment_uncertainty_draws |>
+	left_join(static_dog_assignments, by = c("year", "port", "outcome")) |>
+	group_by(year, port, outcome) |>
+	summarise(
+		dogs_min = min(chunks_assigned, na.rm = TRUE),
+		dogs_p05 = as.integer(quantile(chunks_assigned, 0.05, na.rm = TRUE, type = 1)),
+		dogs_p25 = as.integer(quantile(chunks_assigned, 0.25, na.rm = TRUE, type = 1)),
+		dogs_p50 = as.integer(quantile(chunks_assigned, 0.50, na.rm = TRUE, type = 1)),
+		dogs_p75 = as.integer(quantile(chunks_assigned, 0.75, na.rm = TRUE, type = 1)),
+		dogs_p95 = as.integer(quantile(chunks_assigned, 0.95, na.rm = TRUE, type = 1)),
+		dogs_max = max(chunks_assigned, na.rm = TRUE),
+		dogs_mean = mean(chunks_assigned, na.rm = TRUE),
+		prob_at_least_one_dog = mean(chunks_assigned >= 1, na.rm = TRUE),
+		prob_at_least_static_assignment = mean(chunks_assigned >= first(static_chunks_assigned), na.rm = TRUE),
+		static_chunks_assigned = first(static_chunks_assigned),
+		.groups = "drop"
+	) |>
+	arrange(outcome, year, desc(dogs_p50), desc(dogs_p95), port)
+
+write_csv(
+	dog_assignment_uncertainty_draws,
+	here("outputs", "tables", "limited_port_rerouted_dog_assignment_draws.csv")
+)
+
+write_csv(
+	dog_assignment_uncertainty_summary,
+	here("outputs", "tables", "limited_port_rerouted_dog_assignment_uncertainty.csv")
+)
+
+dog_assignment_uncertainty_summary |>
+	filter(outcome == "at_risk_cattle_state_estimate")
+```
+
+```{r quick-figures, fig.width=10, fig.height=6}
+plot_data <- rerouted_port_year |>
+	filter(outcome == "at_risk_cattle_state_estimate")
+
+ggplot(plot_data, aes(x = rerouted_total_risk, y = reorder(port, rerouted_total_risk), fill = factor(year))) +
+	geom_col(position = "dodge") +
+	labs(
+		title = "Rerouted Port Risk Over Time (Primary Outcome)",
+		x = "rerouted at-risk cattle (state estimate)",
+		y = "port",
+		fill = "year"
+	) +
+	theme_minimal(base_size = 12)
+
+ggsave(
+    here("outputs", "figures", "limited_port_rerouted_port_risk_primary.png"),
+    width = 10,
+    height = 6
+)
+
+dog_plot_data <- dog_assignments_rerouted |>
+	filter(outcome == "at_risk_cattle_state_estimate")
+
+ggplot(dog_plot_data, aes(x = chunks_assigned, y = reorder(port, chunks_assigned), fill = factor(year))) +
+	geom_col(position = "dodge") +
+	labs(
+		title = "Rerouted Port Dog Assignments Over Time (Primary Outcome)",
+		x = "Dogs assigned (state estimate)",
+		y = "port",
+		fill = "year"
+	) +
+	theme_minimal(base_size = 12)
+
+ggsave(
+    here("outputs", "figures", "limited_port_rerouted_port_dog_assignments_primary.png"),
+    width = 10,
+    height = 6
+)
+
+dog_uncertainty_plot_data <- dog_assignment_uncertainty_summary |>
+	filter(outcome == "at_risk_cattle_state_estimate")
+
+dog_uncertainty_position <- position_dodge(width = 0.55)
+
+ggplot(
+	dog_uncertainty_plot_data,
+	aes(x = dogs_p50, y = reorder(port, dogs_p50), color = factor(year), group = factor(year))
+) +
+	geom_errorbarh(
+		aes(xmin = dogs_p05, xmax = dogs_p95),
+		height = 0.25,
+		linewidth = 0.8,
+		position = dog_uncertainty_position
+	) +
+    #plot the median assignment as a solid point
+	geom_point(size = 2.5, position = dog_uncertainty_position) +
+    #Plot the static assignment as an open circle
+	geom_point(aes(x = static_chunks_assigned), shape = 1, size = 3, position = dog_uncertainty_position) +
+	scale_x_continuous(breaks = seq(0, n_dogs, by = 1), limits = c(0, n_dogs)) +
+	labs(
+		title = "Rerouted Dog Assignment Uncertainty (Primary Outcome)",
+		x = "dogs assigned: median with 5th to 95th percentile interval",
+		y = "port",
+		color = "year"
+	) +
+	theme_minimal(base_size = 12)
+
+ggsave(
+	here("outputs", "figures", "limited_port_rerouted_dog_assignment_uncertainty_primary.png"),
+	width = 10,
+	height = 6
+)
+```
+
+```{r save-main-objects}
+saveRDS(
+	list(
+		cross_primary = cross_primary,
+		cross_gravity = cross_gravity,
+		leave_one_port_out = leave_results,
+		rerouted_primary = rerouted_primary,
+		rerouted_gravity = rerouted_gravity,
+		dog_assignments_rerouted = dog_assignments_rerouted,
+		dog_assignment_uncertainty_draws = dog_assignment_uncertainty_draws,
+		dog_assignment_uncertainty_summary = dog_assignment_uncertainty_summary,
+		reroute_uncertainty_summary = reroute_uncertainty_summary
+	),
+	here("data", "processed", "limited_port_openings_model_outputs.rds")
+)
+```
+
+

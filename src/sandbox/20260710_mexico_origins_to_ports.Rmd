@@ -1,0 +1,140 @@
+---
+title: "Mexico Origins to Ports"
+output: html_document
+---
+
+# Gather data regarding cattle origin in Mexico to port of entry in the US
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(tidyverse)
+library(sf)
+library(stringi)
+source("src/normalize_state_name.R")
+```
+
+# Load georeferenced bovine data by state
+```{r summarize-bovine-by-state}
+bovine_state_summary <- readRDS(here("data", "processed", "geolocated_bovine_state_summary.rds"))
+glimpse(bovine_state_summary)
+```
+
+# Load port data
+
+```{r load-port-data}
+port_volume_by_state <- readRDS(here("data", "processed", "port_volume_by_state.rds"))
+glimpse(port_volume_by_state)
+```
+
+
+#    - Percent of state inventory moving to each port
+```{r percent-state-inventory-to-port}
+
+## Align state names between the two processed datasets.
+#state_name_overrides <- c(
+#    "michioacan" = "michoacan",
+#    "distrito federal" = "ciudad de mexico",
+#    "mexico" = "estado de mexico"
+#)
+
+port_state_clean <- port_volume_by_state |>
+    mutate(
+        state_norm = normalize_state_name(state)
+        #,
+        #state_norm = recode(state_norm, !!!state_name_overrides)
+    )
+
+bovine_state_clean <- bovine_state_summary |>
+    sf::st_drop_geometry() |>
+    transmute(
+        state = municipio,
+        total_state_bovine = total_de_bovinos,
+        state_norm = normalize_state_name(municipio)
+    )
+
+state_port_joined <- port_state_clean |>
+    left_join(
+        bovine_state_clean,
+        by = "state_norm",
+        relationship = "many-to-one"
+    ) |> rename(total_port_volume = total_volume)
+
+unmatched_states <- state_port_joined |>
+    filter(is.na(total_state_bovine)) |>
+    distinct(state = state.x, state_norm) |>
+    arrange(state)
+
+unmatched_states
+
+# 1) Total volume from each state to each port.
+state_to_port_total_volume <- state_port_joined |>
+    transmute(
+        year,
+        state = coalesce(state.y, state.x),
+        port,
+        total_port_volume
+    ) |>
+    arrange(year, state, port)
+
+state_to_port_total_volume_wide <- state_to_port_total_volume |>
+    pivot_wider(
+        names_from = port,
+        values_from = total_port_volume,
+        values_fill = 0
+    ) |>
+    arrange(year, state)
+
+state_to_port_total_volume_wide
+
+# 2) Total volume from each state to each port divided by total bovine in each state.
+state_to_port_volume_per_bovine <- state_port_joined |>
+    transmute(
+        year,
+        state = coalesce(state.y, state.x),
+        port,
+        total_port_volume,
+        total_state_bovine,
+        port_volume_per_bovine = if_else(total_state_bovine > 0, total_port_volume / total_state_bovine, NA_real_)
+    ) |>
+    arrange(year, state, port)
+
+state_to_port_volume_per_bovine_wide <- state_to_port_volume_per_bovine |>
+    select(year, state, port, port_volume_per_bovine) |>
+    pivot_wider(
+        names_from = port,
+        values_from = port_volume_per_bovine,
+        values_fill = 0
+    ) |>
+    arrange(year, state)
+
+state_to_port_volume_per_bovine_wide
+
+write.csv(
+    state_to_port_total_volume,
+    here("outputs", "tables", "state_to_port_total_volume.csv"),
+    row.names = FALSE
+)
+
+write.csv(
+    state_to_port_volume_per_bovine,
+    here("outputs", "tables", "state_to_port_volume_per_bovine.csv"),
+    row.names = FALSE
+)
+
+saveRDS(
+    state_to_port_total_volume,
+    here("data", "processed", "state_to_port_total_volume.rds")
+)
+saveRDS(
+    state_to_port_volume_per_bovine,
+    here("data", "processed", "state_to_port_volume_per_bovine.rds")
+)
+
+
+print("Come back to these that are not matched!!:")
+print(unmatched_states)
+
+```
+
