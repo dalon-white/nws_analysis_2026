@@ -11,11 +11,14 @@ library(here)
 library(car)
 library(viridis)
 library(effectsize)
+
+source(here("src", "utils", "port_display_names.R"))
 ```
 
 # idnetify data folder
 ```{r define data folder}
 data_path <- here("data", "processed")
+port_reference_path <- here("data", "raw", "port of entry reference table.xlsx")
 ```
 ## Load Data
 
@@ -40,10 +43,14 @@ rejections_volume <- rejections %>%
     left_join(port_volume, by = c("port", "year"))
 
 rejections_volume <- rejections_volume %>%
-    mutate(rejection_rate = rejections / volume)
-
-rejections_volume <- rejections_volume %>%
-    mutate(across(c(port, year), as.factor))
+    mutate(rejection_rate = rejections / volume) %>%
+    add_port_display_names(
+      data = ., port_col = "port"
+    ) %>%
+    mutate(
+      port = as.factor(port),
+      year = as.factor(year)
+    )
 
 glimpse(rejections_volume)
 ```
@@ -51,12 +58,13 @@ glimpse(rejections_volume)
 ## View rejection volue by port and year
 
 ```{r plot rejection volume}
-rej_volume_plot <- ggplot(rejections_volume, aes(x = port, y = rejections, color = year)) +
-   geom_boxplot(aes(group = port)) +
+rej_volume_plot <- ggplot(rejections_volume, aes(x = port_display, y = rejections, color = year)) +
+  geom_boxplot(aes(group = port_display)) +
     geom_line() +
     geom_point() +
     labs(title = "Rejections by Port and Year", x = "Port", y = "# of Rejections") +
-    theme_minimal()
+   theme_minimal() +
+   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
 rej_volume_plot <- rej_volume_plot +
   scale_color_viridis_d(option = "D")
@@ -65,9 +73,9 @@ rej_volume_fig <- here("outputs", "figures", "rejection_volume.png")
 ggsave(
 	filename = rej_volume_fig,
 	plot = rej_volume_plot,
-	width = 10,
-	height = 7,
-	dpi = 150
+	width = 5,
+	height = 3.5,
+	dpi = 300
 )
 
 cat("Rejection volume figure saved to:", rej_volume_fig, "\n")
@@ -80,11 +88,11 @@ knitr::include_graphics(rej_volume_fig)
 rejections_volume <- rejections_volume %>%
     mutate(log1p_rejection_rate = log1p(rejection_rate))
 
-rej_rate_plot <- ggplot(rejections_volume, aes(x = year, y = rejection_rate, color = port)) +
+rej_rate_plot <- ggplot(rejections_volume, aes(x = year, y = rejection_rate, color = port_display)) +
     geom_boxplot(aes(group = year)) +
     geom_line() +
     geom_point() +
-    labs(title = "Rejection Rate by Port and Year", x = "Year", y = "Fourth Root of Rejection Rate") +
+  labs(title = "Rejection Rate by Port and Year", x = "Year", y = "Fourth Root of Rejection Rate", color = "Port") +
     theme_minimal()
 
 rej_rate_plot <- rej_rate_plot +
@@ -190,13 +198,18 @@ tukey_df <- data.frame(
 # Calculate mean rejection rates for each port
 mean_effects <- rejections_volume %>%
   group_by(port) %>%
-  summarise(mean_rate = mean(rejection_rate_4th_root, na.rm = TRUE)) %>%
-  left_join(tukey_df, by = "port")
+  summarise(mean_rate = mean(rejection_rate_4th_root, na.rm = TRUE), .groups = "drop") %>%
+  mutate(port = as.character(port)) %>%
+  left_join(tukey_df, by = "port") %>%
+  add_port_display_names(
+    port_col = "port",
+    reference_path = port_reference_path
+  )
 
 # Save the Tukey's groupings plot
 tukey_plot_fig <- here("outputs", "figures", "tukey_groupings_port.png")
 
-ggplot(mean_effects, aes(x = reorder(port, mean_rate), y = mean_rate, fill = group)) +
+ggplot(mean_effects, aes(x = reorder(port_display, mean_rate), y = mean_rate, fill = group)) +
   geom_point(stat = "identity", show.legend = FALSE) +
   geom_text(aes(label = group), vjust = -0.5) +
   geom_errorbar(aes(ymin = mean_rate, ymax = mean_rate), width = 0.2) +
@@ -206,6 +219,7 @@ ggplot(mean_effects, aes(x = reorder(port, mean_rate), y = mean_rate, fill = gro
     y = "Mean Fourth Root of Rejection Rate"
   ) +
   theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
   scale_fill_viridis_d() -> tukey_plot
 
 ggsave(
@@ -230,7 +244,12 @@ port_ci <- rejections_volume %>%
     lower_ci = mean_rate - qt(0.975, df = n() - 1) * sd(rejection_rate_4th_root, na.rm = TRUE) / sqrt(n()),
     upper_ci = mean_rate + qt(0.975, df = n() - 1) * sd(rejection_rate_4th_root, na.rm = TRUE) / sqrt(n())
   ) %>%
-  left_join(tukey_df, by = "port")
+  mutate(port = as.character(port)) %>%
+  left_join(tukey_df, by = "port") %>%
+  add_port_display_names(
+    port_col = "port",
+    reference_path = port_reference_path
+  )
 
 port_ci <- port_ci %>%
   mutate(mean_rate = mean_rate^4) %>%
@@ -238,7 +257,7 @@ port_ci <- port_ci %>%
   mutate(upper_ci = upper_ci^4)
 
 # Plot mean effects with 95% CI and Tukey's groupings
-tukey_errorbar_plot <- ggplot(port_ci, aes(x = reorder(port, mean_rate), y = mean_rate, fill = group)) +
+tukey_errorbar_plot <- ggplot(port_ci, aes(x = reorder(port_display, mean_rate), y = mean_rate, fill = group)) +
   geom_bar(stat = "identity", show.legend = FALSE) +
   geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.2) +
   geom_text(aes(label = group), vjust = -0.5) +
@@ -248,6 +267,7 @@ tukey_errorbar_plot <- ggplot(port_ci, aes(x = reorder(port, mean_rate), y = mea
     y = "Mean Rejection Rate"
   ) +
   theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
   scale_fill_viridis_d()
 
 # Save the plot
